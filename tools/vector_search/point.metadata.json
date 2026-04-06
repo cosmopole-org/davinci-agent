@@ -1,0 +1,36 @@
+{
+  "isMcp": true,
+  "tool_id": "vector_search",
+  "vm_name": "data-vm",
+  "machine_id": "data-machine",
+  "image_name": "data-tools:latest",
+  "container_name": "tool-vector-search",
+  "description": "Semantic retrieval",
+  "prompt": "Use for vector similarity retrieval.",
+  "request_point": "tool::vector_search::request",
+  "response_point": "tool::vector_search::response",
+  "risk_level": "low",
+  "requires_network": false,
+  "categories": [
+    "knowledge_retrieval"
+  ],
+  "routes": {
+    "knowledge_retrieval": "vector_search"
+  },
+  "tools": [
+    {
+      "name": "vector_search",
+      "desc": "query vector index for semantic matches",
+      "args": {
+        "query": {
+          "type": "STRING",
+          "desc": "semantic search query"
+        },
+        "top_k": {
+          "type": "INTEGER",
+          "desc": "number of matches to return"
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,36 @@
+{
+  "isMcp": true,
+  "tool_id": "jira_connector",
+  "vm_name": "caspar-miniapps-vm",
+  "machine_id": "apps-machine",
+  "image_name": "apps-tools:latest",
+  "container_name": "tool-jira-connector",
+  "description": "Jira actions",
+  "prompt": "Use for Jira issue operations.",
+  "request_point": "tool::jira_connector::request",
+  "response_point": "tool::jira_connector::response",
+  "risk_level": "high",
+  "requires_network": true,
+  "categories": [
+    "integrations"
+  ],
+  "routes": {
+    "integrations": "jira_action"
+  },
+  "tools": [
+    {
+      "name": "jira_action",
+      "desc": "perform a Jira issue operation",
+      "args": {
+        "operation": {
+          "type": "STRING",
+          "desc": "jira operation name"
+        },
+        "issue_key": {
+          "type": "STRING",
+          "desc": "target issue key when required"
+        }
+      }
+    }
+  ]
+}

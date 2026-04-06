@@ -1,0 +1,32 @@
+{
+  "isMcp": true,
+  "tool_id": "python_exec",
+  "vm_name": "data-vm",
+  "machine_id": "data-machine",
+  "image_name": "data-tools:latest",
+  "container_name": "tool-python-exec",
+  "description": "Run Python jobs",
+  "prompt": "Use for Python code execution tasks.",
+  "request_point": "tool::python_exec::request",
+  "response_point": "tool::python_exec::response",
+  "risk_level": "medium",
+  "requires_network": false,
+  "categories": [
+    "computation"
+  ],
+  "routes": {
+    "computation": "execute"
+  },
+  "tools": [
+    {
+      "name": "execute",
+      "desc": "execute Python code in sandbox",
+      "args": {
+        "code": {
+          "type": "STRING",
+          "desc": "python code to execute"
+        }
+      }
+    }
+  ]
+}

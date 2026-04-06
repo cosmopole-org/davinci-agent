@@ -1,0 +1,32 @@
+{
+  "isMcp": true,
+  "tool_id": "sql_query",
+  "vm_name": "data-vm",
+  "machine_id": "data-machine",
+  "image_name": "data-tools:latest",
+  "container_name": "tool-sql-query",
+  "description": "Run SQL",
+  "prompt": "Use for SQL analytics queries.",
+  "request_point": "tool::sql_query::request",
+  "response_point": "tool::sql_query::response",
+  "risk_level": "high",
+  "requires_network": false,
+  "categories": [
+    "analytics"
+  ],
+  "routes": {
+    "analytics": "query"
+  },
+  "tools": [
+    {
+      "name": "query",
+      "desc": "execute SQL and return result rows",
+      "args": {
+        "sql": {
+          "type": "STRING",
+          "desc": "SQL statement to execute"
+        }
+      }
+    }
+  ]
+}

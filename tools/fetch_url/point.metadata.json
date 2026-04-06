@@ -1,0 +1,32 @@
+{
+  "isMcp": true,
+  "tool_id": "fetch_url",
+  "vm_name": "web-vm",
+  "machine_id": "web-machine",
+  "image_name": "web-tools:latest",
+  "container_name": "tool-fetch-url",
+  "description": "Fetch URL content",
+  "prompt": "Use to retrieve content from a specific URL.",
+  "request_point": "tool::fetch_url::request",
+  "response_point": "tool::fetch_url::response",
+  "risk_level": "medium",
+  "requires_network": true,
+  "categories": [
+    "research"
+  ],
+  "routes": {
+    "research": "fetch"
+  },
+  "tools": [
+    {
+      "name": "fetch",
+      "desc": "fetch and return page content from a URL",
+      "args": {
+        "url": {
+          "type": "STRING",
+          "desc": "absolute URL to fetch"
+        }
+      }
+    }
+  ]
+}

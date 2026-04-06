@@ -1,0 +1,32 @@
+{
+  "isMcp": true,
+  "tool_id": "web_search",
+  "vm_name": "web-vm",
+  "machine_id": "web-machine",
+  "image_name": "web-tools:latest",
+  "container_name": "tool-web-search",
+  "description": "Search web",
+  "prompt": "Use to gather fresh web search results.",
+  "request_point": "tool::web_search::request",
+  "response_point": "tool::web_search::response",
+  "risk_level": "medium",
+  "requires_network": true,
+  "categories": [
+    "research"
+  ],
+  "routes": {
+    "research": "search"
+  },
+  "tools": [
+    {
+      "name": "search",
+      "desc": "search the web with a text query",
+      "args": {
+        "query": {
+          "type": "STRING",
+          "desc": "web search query"
+        }
+      }
+    }
+  ]
+}

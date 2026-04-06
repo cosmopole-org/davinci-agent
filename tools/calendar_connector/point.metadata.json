@@ -1,0 +1,36 @@
+{
+  "isMcp": true,
+  "tool_id": "calendar_connector",
+  "vm_name": "caspar-miniapps-vm",
+  "machine_id": "apps-machine",
+  "image_name": "apps-tools:latest",
+  "container_name": "tool-calendar-connector",
+  "description": "Calendar actions",
+  "prompt": "Use for calendar scheduling operations.",
+  "request_point": "tool::calendar_connector::request",
+  "response_point": "tool::calendar_connector::response",
+  "risk_level": "high",
+  "requires_network": true,
+  "categories": [
+    "integrations"
+  ],
+  "routes": {
+    "integrations": "calendar_action"
+  },
+  "tools": [
+    {
+      "name": "calendar_action",
+      "desc": "perform calendar event operation",
+      "args": {
+        "operation": {
+          "type": "STRING",
+          "desc": "calendar operation name"
+        },
+        "calendar_id": {
+          "type": "STRING",
+          "desc": "calendar identifier"
+        }
+      }
+    }
+  ]
+}

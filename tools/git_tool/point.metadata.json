@@ -1,0 +1,52 @@
+{
+  "isMcp": true,
+  "tool_id": "git_tool",
+  "vm_name": "git-vm",
+  "machine_id": "git-machine",
+  "image_name": "git-tools:latest",
+  "container_name": "tool-git",
+  "description": "Unified git tool with multi-function routing.",
+  "prompt": "Use for repository status, commit, and pull request workflows.",
+  "request_point": "tool::git::request",
+  "response_point": "tool::git::response",
+  "risk_level": "high",
+  "requires_network": false,
+  "categories": [
+    "version_control",
+    "deployment"
+  ],
+  "routes": {
+    "version_control": "status_commit",
+    "deployment": "open_pr"
+  },
+  "tools": [
+    {
+      "name": "status_commit",
+      "desc": "inspect repo status, stage files, and create a commit",
+      "args": {
+        "action": {
+          "type": "STRING",
+          "desc": "git action to perform"
+        },
+        "message": {
+          "type": "STRING",
+          "desc": "commit message when committing"
+        }
+      }
+    },
+    {
+      "name": "open_pr",
+      "desc": "open or update pull request for committed changes",
+      "args": {
+        "title": {
+          "type": "STRING",
+          "desc": "pull request title"
+        },
+        "body": {
+          "type": "STRING",
+          "desc": "pull request body"
+        }
+      }
+    }
+  ]
+}

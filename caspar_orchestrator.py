@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import json
+import os
 import socket
 from typing import Any, Dict, Iterable, List, Optional
 
@@ -54,6 +55,8 @@ class ToolCapability:
     response_point: str
     risk_level: str = "medium"
     requires_network: bool = False
+    prompt: Optional[str] = None
+    function_schemas: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -152,6 +155,20 @@ class CasparVmmClient:
             results.append(self.host_call(action.host_function, action.input_payload))
         return results
 
+    def list_point_apps(self, point_id: str) -> Dict[str, Any]:
+        """Fetch installed machines/apps/programs for a point via Caspar protocol API."""
+        result = self.host_call(
+            VmmHostFunction.HTTP_POST,
+            {
+                "path": "/points/listApps",
+                "data": json.dumps({"pointId": point_id}),
+                "headers": {"content-type": "application/json"},
+            },
+        )
+        if isinstance(result, dict) and isinstance(result.get("response"), dict):
+            return result["response"]
+        return {}
+
 
 class DavinciToolRegistry:
     def __init__(self) -> None:
@@ -168,6 +185,187 @@ class DavinciToolRegistry:
         for vm in self._vms.values():
             tools.extend(vm.tools)
         return tools
+
+
+def _iter_entities(point_catalog: Dict[str, Any]) -> Iterable[Dict[str, Any]]:
+    for group in ("machines", "apps", "programs"):
+        values = point_catalog.get(group, {})
+        if isinstance(values, dict):
+            yield from values.values()
+        elif isinstance(values, list):
+            yield from values
+
+
+def _tool_arg_spec_to_schema(args: Any) -> Dict[str, Any]:
+    properties: Dict[str, Any] = {}
+    required: List[str] = []
+    if not isinstance(args, dict):
+        return {"type": "object", "properties": properties}
+    type_map = {
+        "STRING": "string",
+        "NUMBER": "number",
+        "INTEGER": "integer",
+        "BOOLEAN": "boolean",
+        "ARRAY": "array",
+        "OBJECT": "object",
+    }
+    for arg_name, arg_meta in args.items():
+        if not isinstance(arg_meta, dict):
+            continue
+        raw_type = str(arg_meta.get("type", "STRING")).upper()
+        properties[arg_name] = {
+            "type": type_map.get(raw_type, "string"),
+            "description": str(arg_meta.get("desc", "")),
+        }
+        required.append(arg_name)
+    schema: Dict[str, Any] = {"type": "object", "properties": properties}
+    if required:
+        schema["required"] = required
+    return schema
+
+
+def _capability_from_entity_metadata(entity: Dict[str, Any], metadata: Dict[str, Any]) -> Optional[ToolCapability]:
+    if not isinstance(metadata.get("tools"), list):
+        return None
+    tools = [t for t in metadata["tools"] if isinstance(t, dict)]
+    if not tools:
+        return None
+
+    # MCP-style metadata (`isMcp: true`, `tools: [{name, desc, args}]`)
+    if metadata.get("isMcp") is True and all("name" in t for t in tools):
+        tool_id = str(metadata.get("tool_id") or entity.get("username") or entity.get("userId") or "mcp_tool")
+        vm_name = str(metadata.get("vm_name", "mcp-vm"))
+        request_point = str(metadata.get("request_point", f"tool::{tool_id}::request"))
+        response_point = str(metadata.get("response_point", f"tool::{tool_id}::response"))
+        categories = metadata.get("categories", ["mcp"])
+        if not isinstance(categories, list) or not categories:
+            categories = ["mcp"]
+
+        routes = metadata.get("routes")
+        functions: Dict[str, str]
+        if isinstance(routes, dict):
+            functions = {str(k): str(v) for k, v in routes.items()}
+        else:
+            default_function = str(tools[0].get("name", "invoke"))
+            functions = {str(category): default_function for category in categories}
+
+        tool_index = {str(t.get("name")): t for t in tools}
+        function_schemas: Dict[str, Dict[str, Any]] = {}
+        for category, fn_name in functions.items():
+            fn_meta = tool_index.get(fn_name, {})
+            function_schemas[category] = {
+                "name": fn_name,
+                "description": str(fn_meta.get("desc", "")),
+                "input_schema": _tool_arg_spec_to_schema(fn_meta.get("args", {})),
+                "output_schema": fn_meta.get("output_schema", {"type": "object"}),
+            }
+
+        return ToolCapability(
+            tool_id=tool_id,
+            categories=[str(c) for c in categories],
+            functions=functions,
+            description=str(metadata.get("description", metadata.get("desc", tool_id))),
+            vm_name=vm_name,
+            container=ToolContainerSpec(
+                machine_id=str(metadata.get("machine_id") or entity.get("userId", "")),
+                image_name=str(metadata.get("image_name", "")),
+                container_name=str(metadata.get("container_name", "")),
+                tool_root=f"tools/{tool_id}",
+                dockerfile_path=f"tools/{tool_id}/Dockerfile",
+                vm_type=str(metadata.get("vm_type", "docker")),
+            ),
+            request_point=request_point,
+            response_point=response_point,
+            risk_level=str(metadata.get("risk_level", "medium")),
+            requires_network=bool(metadata.get("requires_network", False)),
+            prompt=metadata.get("prompt"),
+            function_schemas=function_schemas,
+        )
+    return None
+
+
+def discover_tool_capabilities(point_catalog: Dict[str, Any]) -> List[ToolCapability]:
+    """Load tool capabilities from installed machines/apps/programs metadata."""
+
+    capabilities: List[ToolCapability] = []
+    for entity in _iter_entities(point_catalog):
+        if not isinstance(entity, dict):
+            continue
+        metadata = entity.get("metadata", {})
+        if not isinstance(metadata, dict):
+            continue
+        mcp_capability = _capability_from_entity_metadata(entity, metadata)
+        if mcp_capability:
+            capabilities.append(mcp_capability)
+            continue
+        tools = metadata.get("tools", [])
+        if not isinstance(tools, list):
+            continue
+        for raw_tool in tools:
+            if not isinstance(raw_tool, dict):
+                continue
+            categories = raw_tool.get("categories")
+            functions = raw_tool.get("functions")
+            function_schemas: Dict[str, Dict[str, Any]] = {}
+
+            if isinstance(functions, list):
+                categories = []
+                category_to_function: Dict[str, str] = {}
+                for fn in functions:
+                    if not isinstance(fn, dict):
+                        continue
+                    category = str(fn.get("category", "")).strip()
+                    name = str(fn.get("name", "invoke")).strip() or "invoke"
+                    if not category:
+                        continue
+                    if category not in categories:
+                        categories.append(category)
+                    category_to_function[category] = name
+                    function_schemas[category] = {
+                        "name": name,
+                        "description": str(fn.get("description", "")),
+                        "input_schema": fn.get("input_schema", {}),
+                        "output_schema": fn.get("output_schema", {}),
+                    }
+                functions = category_to_function
+
+            required = (
+                "tool_id",
+                "vm_name",
+                "description",
+                "request_point",
+                "response_point",
+            )
+            if not all(key in raw_tool for key in required):
+                continue
+            if not isinstance(categories, list) or not isinstance(functions, dict):
+                continue
+            tool_id = str(raw_tool["tool_id"])
+            tool_root = f"tools/{tool_id}"
+            capabilities.append(
+                ToolCapability(
+                    tool_id=tool_id,
+                    categories=list(categories),
+                    functions=dict(functions),
+                    description=str(raw_tool["description"]),
+                    vm_name=str(raw_tool["vm_name"]),
+                    container=ToolContainerSpec(
+                        machine_id=str(raw_tool.get("machine_id") or entity.get("userId", "")),
+                        image_name=str(raw_tool.get("image_name", "")),
+                        container_name=str(raw_tool.get("container_name", "")),
+                        tool_root=tool_root,
+                        dockerfile_path=f"{tool_root}/Dockerfile",
+                        vm_type=str(raw_tool.get("vm_type", "docker")),
+                    ),
+                    request_point=str(raw_tool["request_point"]),
+                    response_point=str(raw_tool["response_point"]),
+                    risk_level=str(raw_tool.get("risk_level", "medium")),
+                    requires_network=bool(raw_tool.get("requires_network", False)),
+                    prompt=raw_tool.get("prompt"),
+                    function_schemas=function_schemas,
+                )
+            )
+    return capabilities
 
 
 class DavinciPlanner:
@@ -243,174 +441,36 @@ class DavinciPlanner:
         return {"low": 0, "medium": 1, "high": 2}.get(level, 99)
 
 
-def bootstrap_default_registry() -> DavinciToolRegistry:
+def _load_catalog_from_env() -> Dict[str, Any]:
+    raw = os.environ.get("CASPAR_POINT_APPS_JSON", "").strip()
+    if not raw:
+        return {}
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+
+
+def bootstrap_default_registry(
+    point_id: Optional[str] = None,
+    client: Optional[CasparVmmClient] = None,
+    point_catalog: Optional[Dict[str, Any]] = None,
+) -> DavinciToolRegistry:
     registry = DavinciToolRegistry()
+    resolved_catalog = point_catalog
+    if resolved_catalog is None:
+        resolved_catalog = _load_catalog_from_env()
+    if not resolved_catalog and point_id:
+        resolved_catalog = (client or CasparVmmClient()).list_point_apps(point_id)
 
-    def spec(machine: str, image: str, container: str, tool_id: str) -> ToolContainerSpec:
-        tool_root = f"tools/{tool_id}"
-        return ToolContainerSpec(
-            machine_id=machine,
-            image_name=image,
-            container_name=container,
-            tool_root=tool_root,
-            dockerfile_path=f"{tool_root}/Dockerfile",
-        )
+    capabilities = discover_tool_capabilities(resolved_catalog or {})
+    grouped: Dict[str, List[ToolCapability]] = {}
+    for capability in capabilities:
+        grouped.setdefault(capability.vm_name, []).append(capability)
 
-    git_vm = VMDescriptor(
-        name="git-vm",
-        tools=[
-            ToolCapability(
-                tool_id="git_tool",
-                categories=["version_control", "deployment"],
-                functions={
-                    "version_control": "status_commit",
-                    "deployment": "open_pr",
-                },
-                description="Unified git tool with multi-function routing.",
-                vm_name="git-vm",
-                container=spec("git-machine", "git-tools:latest", "tool-git", "git_tool"),
-                request_point="tool::git::request",
-                response_point="tool::git::response",
-                risk_level="high",
-            ),
-        ],
-    )
-
-    web_vm = VMDescriptor(
-        name="web-vm",
-        tools=[
-            ToolCapability(
-                tool_id="web_search",
-                categories=["research"],
-                functions={"research": "search"},
-                description="Search web",
-                vm_name="web-vm",
-                container=spec("web-machine", "web-tools:latest", "tool-web-search", "web_search"),
-                request_point="tool::web_search::request",
-                response_point="tool::web_search::response",
-                risk_level="medium",
-                requires_network=True,
-            ),
-            ToolCapability(
-                tool_id="fetch_url",
-                categories=["research"],
-                functions={"research": "fetch"},
-                description="Fetch URL content",
-                vm_name="web-vm",
-                container=spec("web-machine", "web-tools:latest", "tool-fetch-url", "fetch_url"),
-                request_point="tool::fetch_url::request",
-                response_point="tool::fetch_url::response",
-                risk_level="medium",
-                requires_network=True,
-            ),
-            ToolCapability(
-                tool_id="browser_automation",
-                categories=["ui_automation"],
-                functions={"ui_automation": "automate"},
-                description="Automate browser",
-                vm_name="web-vm",
-                container=spec(
-                    "web-machine",
-                    "browser-tools:latest",
-                    "tool-browser-automation",
-                    "browser_automation",
-                ),
-                request_point="tool::browser_automation::request",
-                response_point="tool::browser_automation::response",
-                risk_level="high",
-                requires_network=True,
-            ),
-        ],
-    )
-
-    data_vm = VMDescriptor(
-        name="data-vm",
-        tools=[
-            ToolCapability(
-                tool_id="vector_search",
-                categories=["knowledge_retrieval"],
-                functions={"knowledge_retrieval": "vector_search"},
-                description="Semantic retrieval",
-                vm_name="data-vm",
-                container=spec("data-machine", "data-tools:latest", "tool-vector-search", "vector_search"),
-                request_point="tool::vector_search::request",
-                response_point="tool::vector_search::response",
-                risk_level="low",
-            ),
-            ToolCapability(
-                tool_id="sql_query",
-                categories=["analytics"],
-                functions={"analytics": "query"},
-                description="Run SQL",
-                vm_name="data-vm",
-                container=spec("data-machine", "data-tools:latest", "tool-sql-query", "sql_query"),
-                request_point="tool::sql_query::request",
-                response_point="tool::sql_query::response",
-                risk_level="high",
-            ),
-            ToolCapability(
-                tool_id="python_exec",
-                categories=["computation"],
-                functions={"computation": "execute"},
-                description="Run Python jobs",
-                vm_name="data-vm",
-                container=spec("data-machine", "data-tools:latest", "tool-python-exec", "python_exec"),
-                request_point="tool::python_exec::request",
-                response_point="tool::python_exec::response",
-                risk_level="medium",
-            ),
-        ],
-    )
-
-    miniapps_vm = VMDescriptor(
-        name="caspar-miniapps-vm",
-        tools=[
-            ToolCapability(
-                tool_id="slack_connector",
-                categories=["integrations"],
-                functions={"integrations": "slack_action"},
-                description="Slack actions",
-                vm_name="caspar-miniapps-vm",
-                container=spec("apps-machine", "apps-tools:latest", "tool-slack-connector", "slack_connector"),
-                request_point="tool::slack_connector::request",
-                response_point="tool::slack_connector::response",
-                risk_level="medium",
-                requires_network=True,
-            ),
-            ToolCapability(
-                tool_id="jira_connector",
-                categories=["integrations"],
-                functions={"integrations": "jira_action"},
-                description="Jira actions",
-                vm_name="caspar-miniapps-vm",
-                container=spec("apps-machine", "apps-tools:latest", "tool-jira-connector", "jira_connector"),
-                request_point="tool::jira_connector::request",
-                response_point="tool::jira_connector::response",
-                risk_level="high",
-                requires_network=True,
-            ),
-            ToolCapability(
-                tool_id="calendar_connector",
-                categories=["integrations"],
-                functions={"integrations": "calendar_action"},
-                description="Calendar actions",
-                vm_name="caspar-miniapps-vm",
-                container=spec(
-                    "apps-machine",
-                    "apps-tools:latest",
-                    "tool-calendar-connector",
-                    "calendar_connector",
-                ),
-                request_point="tool::calendar_connector::request",
-                response_point="tool::calendar_connector::response",
-                risk_level="high",
-                requires_network=True,
-            ),
-        ],
-    )
-
-    for vm in (git_vm, web_vm, data_vm, miniapps_vm):
-        registry.register_vm(vm)
+    for vm_name in sorted(grouped):
+        vm_tools = sorted(grouped[vm_name], key=lambda t: t.tool_id)
+        registry.register_vm(VMDescriptor(name=vm_name, tools=vm_tools))
 
     return registry
 

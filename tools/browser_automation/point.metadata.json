@@ -1,0 +1,32 @@
+{
+  "isMcp": true,
+  "tool_id": "browser_automation",
+  "vm_name": "web-vm",
+  "machine_id": "web-machine",
+  "image_name": "browser-tools:latest",
+  "container_name": "tool-browser-automation",
+  "description": "Automate browser",
+  "prompt": "Use for UI/browser automation tasks.",
+  "request_point": "tool::browser_automation::request",
+  "response_point": "tool::browser_automation::response",
+  "risk_level": "high",
+  "requires_network": true,
+  "categories": [
+    "ui_automation"
+  ],
+  "routes": {
+    "ui_automation": "automate"
+  },
+  "tools": [
+    {
+      "name": "automate",
+      "desc": "run browser automation workflow steps",
+      "args": {
+        "steps": {
+          "type": "ARRAY",
+          "desc": "ordered browser steps to run"
+        }
+      }
+    }
+  ]
+}

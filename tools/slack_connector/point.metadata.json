@@ -1,0 +1,36 @@
+{
+  "isMcp": true,
+  "tool_id": "slack_connector",
+  "vm_name": "caspar-miniapps-vm",
+  "machine_id": "apps-machine",
+  "image_name": "apps-tools:latest",
+  "container_name": "tool-slack-connector",
+  "description": "Slack actions",
+  "prompt": "Use for Slack workspace operations.",
+  "request_point": "tool::slack_connector::request",
+  "response_point": "tool::slack_connector::response",
+  "risk_level": "medium",
+  "requires_network": true,
+  "categories": [
+    "integrations"
+  ],
+  "routes": {
+    "integrations": "slack_action"
+  },
+  "tools": [
+    {
+      "name": "slack_action",
+      "desc": "perform a Slack operation",
+      "args": {
+        "operation": {
+          "type": "STRING",
+          "desc": "slack operation name"
+        },
+        "channel": {
+          "type": "STRING",
+          "desc": "target channel id or name"
+        }
+      }
+    }
+  ]
+}

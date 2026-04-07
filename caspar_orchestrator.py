@@ -93,6 +93,37 @@ class ExecutionPlan:
     rationale: str
 
 
+@dataclass(frozen=True)
+class WorkerTemplate:
+    """Blueprint for a short-lived worker VM managed by the master agent."""
+
+    role: str
+    image_name: str
+    vm_name: str
+    request_point: str
+    response_point: str
+    categories: List[str]
+    startup_command: Optional[str] = None
+    env: Dict[str, str] = field(default_factory=dict)
+    vm_type: str = "docker"
+    risk_level: str = "medium"
+
+
+@dataclass(frozen=True)
+class WorkerInstance:
+    """One runtime worker VM created for a specific parent task."""
+
+    worker_id: str
+    role: str
+    vm_name: str
+    machine_id: str
+    request_point: str
+    response_point: str
+    task_id: str
+    categories: List[str]
+    risk_level: str = "medium"
+
+
 class CasparVmmTransport:
     """Packet transport compatible with Caspar Docker SDK framing."""
 
@@ -185,6 +216,173 @@ class DavinciToolRegistry:
         for vm in self._vms.values():
             tools.extend(vm.tools)
         return tools
+
+
+class MasterWorkerOrchestrator:
+    """HiClaw-style manager/worker orchestration on top of Caspar host functions."""
+
+    def __init__(self, client: CasparVmmClient, templates: Optional[List[WorkerTemplate]] = None) -> None:
+        self.client = client
+        self.templates: Dict[str, WorkerTemplate] = {template.role: template for template in templates or []}
+        self._workers: Dict[str, WorkerInstance] = {}
+
+    def register_template(self, template: WorkerTemplate) -> None:
+        self.templates[template.role] = template
+
+    def list_workers(self) -> List[WorkerInstance]:
+        return list(self._workers.values())
+
+    def launch_worker(self, role: str, task_id: str, worker_id: Optional[str] = None) -> WorkerInstance:
+        template = self.templates[role]
+        resolved_worker_id = worker_id or f"{role}-{task_id}"
+        machine_id = f"{template.vm_name}-{resolved_worker_id}"
+
+        run_payload = {
+            "name": machine_id,
+            "type": template.vm_type,
+            "imageName": template.image_name,
+            "cmd": template.startup_command or "",
+            "envs": template.env,
+            "metadata": {
+                "role": template.role,
+                "taskId": task_id,
+                "requestPoint": template.request_point,
+                "responsePoint": template.response_point,
+            },
+        }
+        self.client.host_call(VmmHostFunction.RUN_VM, run_payload)
+
+        worker = WorkerInstance(
+            worker_id=resolved_worker_id,
+            role=template.role,
+            vm_name=template.vm_name,
+            machine_id=machine_id,
+            request_point=template.request_point,
+            response_point=template.response_point,
+            task_id=task_id,
+            categories=list(template.categories),
+            risk_level=template.risk_level,
+        )
+        self._workers[worker.worker_id] = worker
+        return worker
+
+    def assign_task(
+        self,
+        worker_id: str,
+        task: str,
+        category: str,
+        function_name: str = "invoke",
+        user_id: str = "davinci-master",
+    ) -> Dict[str, Any]:
+        worker = self._workers[worker_id]
+        data = {
+            "workerId": worker.worker_id,
+            "machineId": worker.machine_id,
+            "role": worker.role,
+            "taskId": worker.task_id,
+            "category": category,
+            "function": function_name,
+            "task": task,
+            "expectedResponsePoint": worker.response_point,
+        }
+        return self.client.host_call(
+            VmmHostFunction.SIGNAL_POINT,
+            {
+                "type": "broadcast",
+                "pointId": worker.request_point,
+                "userId": user_id,
+                "data": json.dumps(data),
+            },
+        )
+
+    def terminate_worker(self, worker_id: str) -> Dict[str, Any]:
+        worker = self._workers.pop(worker_id)
+        return self.client.host_call(VmmHostFunction.TERMINATE_VM, {"machineId": worker.machine_id})
+
+    def plan_hierarchical_execution(self, task: str, required_categories: List[str]) -> ExecutionPlan:
+        actions: List[ExecutionAction] = []
+        missing: List[str] = []
+        high_risk = False
+        task_id = task.lower().replace(" ", "-")[:48] or "task"
+
+        # launch one worker per template needed for category coverage
+        launched: Dict[str, WorkerInstance] = {}
+        for category in required_categories:
+            template = next((t for t in self.templates.values() if category in t.categories), None)
+            if not template:
+                missing.append(category)
+                continue
+            if template.role not in launched:
+                worker = self.launch_worker(role=template.role, task_id=task_id)
+                launched[template.role] = worker
+                if template.risk_level == "high":
+                    high_risk = True
+                actions.append(
+                    ExecutionAction(
+                        phase="provision_worker",
+                        tool_id=template.role,
+                        vm_name=template.vm_name,
+                        category=category,
+                        host_function=VmmHostFunction.RUN_VM,
+                        input_payload={
+                            "name": worker.machine_id,
+                            "type": template.vm_type,
+                            "imageName": template.image_name,
+                        },
+                        reason=f"Provision worker role {template.role} for categories {template.categories}.",
+                    )
+                )
+
+            worker = launched[template.role]
+            actions.append(
+                ExecutionAction(
+                    phase="signal_request",
+                    tool_id=worker.worker_id,
+                    vm_name=worker.vm_name,
+                    category=category,
+                    host_function=VmmHostFunction.SIGNAL_POINT,
+                    input_payload={
+                        "type": "broadcast",
+                        "pointId": worker.request_point,
+                        "userId": "davinci-master",
+                        "data": json.dumps(
+                            {
+                                "workerId": worker.worker_id,
+                                "taskId": worker.task_id,
+                                "category": category,
+                                "task": task,
+                                "expectedResponsePoint": worker.response_point,
+                            }
+                        ),
+                    },
+                    reason=f"Delegate {category} to worker role {worker.role}.",
+                )
+            )
+
+        for worker in launched.values():
+            actions.append(
+                ExecutionAction(
+                    phase="cleanup_worker",
+                    tool_id=worker.worker_id,
+                    vm_name=worker.vm_name,
+                    category="lifecycle",
+                    host_function=VmmHostFunction.TERMINATE_VM,
+                    input_payload={"machineId": worker.machine_id},
+                    reason=f"Terminate ephemeral worker {worker.worker_id} after task completion.",
+                )
+            )
+
+        rationale = (
+            "Master-worker orchestration plan generated with lifecycle control via runVm/terminateVm."
+            if not missing
+            else f"Missing worker templates for categories: {', '.join(missing)}"
+        )
+        return ExecutionPlan(
+            task=task,
+            actions=actions,
+            human_review_required=high_risk or bool(missing),
+            rationale=rationale,
+        )
 
 
 def _iter_entities(point_catalog: Dict[str, Any]) -> Iterable[Dict[str, Any]]:

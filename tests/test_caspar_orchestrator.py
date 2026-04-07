@@ -5,7 +5,9 @@ from caspar_orchestrator import (
     ActionRequest,
     CasparVmmClient,
     DavinciPlanner,
+    MasterWorkerOrchestrator,
     VmmHostFunction,
+    WorkerTemplate,
     bootstrap_default_registry,
 )
 
@@ -202,3 +204,61 @@ def test_tool_point_metadata_files_include_function_schemas():
             assert "name" in fn
             assert "desc" in fn
             assert "args" in fn
+
+
+def test_master_worker_orchestrator_lifecycle_calls_run_and_terminate_vm():
+    fake = FakeTransport()
+    client = CasparVmmClient(transport=fake)
+    orchestrator = MasterWorkerOrchestrator(
+        client=client,
+        templates=[
+            WorkerTemplate(
+                role="researcher",
+                image_name="worker-research:latest",
+                vm_name="research-worker-vm",
+                request_point="worker::research::request",
+                response_point="worker::research::response",
+                categories=["research"],
+            )
+        ],
+    )
+
+    worker = orchestrator.launch_worker(role="researcher", task_id="task-123")
+    assert worker.role == "researcher"
+    assert fake.sent[0][0]["key"] == VmmHostFunction.RUN_VM
+
+    orchestrator.assign_task(worker_id=worker.worker_id, task="find recent updates", category="research")
+    assert fake.sent[1][0]["key"] == VmmHostFunction.SIGNAL_POINT
+
+    orchestrator.terminate_worker(worker_id=worker.worker_id)
+    assert fake.sent[2][0]["key"] == VmmHostFunction.TERMINATE_VM
+
+
+def test_hierarchical_execution_plan_includes_worker_lifecycle_actions():
+    fake = FakeTransport()
+    client = CasparVmmClient(transport=fake)
+    orchestrator = MasterWorkerOrchestrator(
+        client=client,
+        templates=[
+            WorkerTemplate(
+                role="coder",
+                image_name="worker-coder:latest",
+                vm_name="coder-worker-vm",
+                request_point="worker::coder::request",
+                response_point="worker::coder::response",
+                categories=["implementation", "testing"],
+                risk_level="high",
+            )
+        ],
+    )
+
+    plan = orchestrator.plan_hierarchical_execution(
+        task="implement tests for module",
+        required_categories=["implementation", "testing"],
+    )
+
+    phases = [action.phase for action in plan.actions]
+    assert phases[0] == "provision_worker"
+    assert phases.count("signal_request") == 2
+    assert phases[-1] == "cleanup_worker"
+    assert plan.human_review_required is True

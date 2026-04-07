@@ -34,6 +34,18 @@ The runtime follows two key rules:
    Davinci does not start tool containers itself. Tools are expected to be
    running and reachable before task processing begins.
 
+### Optional master-worker mode (HiClaw-inspired)
+
+Davinci also supports a **manager/worker orchestration pattern** for dynamic
+task bursts:
+
+- master launches ephemeral worker VMs with `runVm`,
+- master delegates category-specific tasks through worker request points,
+- master terminates workers after completion via `terminateVm`.
+
+This allows Davinci to mix always-on tools with short-lived worker swarms for
+complex jobs that need isolated execution contexts.
+
 For each tool invocation, Davinci emits one signal to the tool request point
 and includes:
 

@@ -45,6 +45,7 @@ class AgenticRuntime:
             self._planning_reasoning,
             self._tool_use_and_function_calls,
             self._multi_vm_orchestration,
+            self._master_worker_orchestration,
             self._human_in_the_loop,
             self._memory_state,
             self._retrieval_augmented_generation,
@@ -96,6 +97,17 @@ class AgenticRuntime:
             implementation="Caspar VMM host-call model + per-VM tool catalogs + routing planner.",
             inspired_by=["Multi-agent architectures", "MCP-style tool registries"],
             evidence=f"registered_vms={vm_count}",
+        )
+
+    def _master_worker_orchestration(self) -> FeatureStatus:
+        return FeatureStatus(
+            key="master_worker_orchestration",
+            supported=True,
+            scope="caspar_vm_lifecycle",
+            reason="Master can spawn ephemeral workers, delegate tasks, and terminate workers via host functions.",
+            implementation="runVm + signalPoint + terminateVm lifecycle orchestration.",
+            inspired_by=["HiClaw manager-workers", "Hierarchical multi-agent planners"],
+            evidence="MasterWorkerOrchestrator available in caspar_orchestrator.py",
         )
 
     def _human_in_the_loop(self) -> FeatureStatus:

@@ -105,7 +105,7 @@ class AgenticRuntime:
             supported=True,
             scope="caspar_vm_lifecycle",
             reason="Master can spawn ephemeral workers, delegate tasks, and terminate workers via host functions.",
-            implementation="runVm + signalPoint + terminateVm lifecycle orchestration.",
+            implementation="runVm + signal + terminateVm lifecycle orchestration.",
             inspired_by=["HiClaw manager-workers", "Hierarchical multi-agent planners"],
             evidence="MasterWorkerOrchestrator available in caspar_orchestrator.py",
         )
@@ -201,7 +201,7 @@ class AgenticRuntime:
             reason="Repository context available for commits/PR workflow."
             if ok
             else "Not currently inside a git work tree.",
-            implementation="git-vm unified tool routed via signalPoint request/response channels.",
+            implementation="git-vm unified tool routed via signal host-function request/response channels.",
             inspired_by=["Claude Code", "CI-aware coding agents"],
             evidence=proc.stdout.strip() or proc.stderr.strip(),
         )
@@ -248,7 +248,7 @@ class AgenticRuntime:
             reason="Browser/UI automation can be offloaded to a dedicated worker VM."
             if supported
             else "No browser automation tool registered.",
-            implementation="browser_automation routed through signalPoint request/response flow.",
+            implementation="browser_automation routed through signal host-function request/response flow.",
             inspired_by=["Computer-use agents", "RPA workflows"],
             evidence=", ".join(categories.get("ui_automation", [])) or None,
         )
@@ -263,7 +263,7 @@ class AgenticRuntime:
             reason="Third-party product actions can run through mini-app connectors."
             if supported
             else "No integration connectors registered.",
-            implementation="mini-app connectors routed via signalPoint request/response flow.",
+            implementation="mini-app connectors routed via signal host-function request/response flow.",
             inspired_by=["Action agents", "Enterprise copilots"],
             evidence=", ".join(categories.get("integrations", [])) or None,
         )

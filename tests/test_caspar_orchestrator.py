@@ -163,12 +163,12 @@ def test_planner_uses_signal_only_for_pre_running_tools():
 
     assert len(plan.actions) == 3
     assert all(a.phase == "signal_request" for a in plan.actions)
-    assert all(a.host_function == VmmHostFunction.SIGNAL_POINT for a in plan.actions)
+    assert all(a.host_function == VmmHostFunction.SIGNAL for a in plan.actions)
     assert all("expectedResponsePoint" in a.input_payload["data"] for a in plan.actions)
     assert plan.human_review_required is True
 
 
-def test_vmm_client_executes_plan_actions_via_signal_point():
+def test_vmm_client_executes_plan_actions_via_signal():
     fake = FakeTransport()
     client = CasparVmmClient(transport=fake)
 
@@ -179,17 +179,19 @@ def test_vmm_client_executes_plan_actions_via_signal_point():
     results = client.execute_plan(plan)
 
     assert len(results) == 1
-    assert fake.sent[0][0]["key"] == VmmHostFunction.SIGNAL_POINT
+    assert fake.sent[0][0]["key"] == VmmHostFunction.SIGNAL
+    assert fake.sent[0][0]["input"]["type"] == "machine"
+    assert "machineId" in fake.sent[0][0]["input"]
 
 
-def test_point_catalog_fetch_uses_http_post_protocol():
+def test_point_catalog_fetch_uses_protocol_api_host_function():
     fake = FakeTransport()
     client = CasparVmmClient(transport=fake)
 
     client.list_point_apps("point-123")
 
-    assert fake.sent[0][0]["key"] == VmmHostFunction.HTTP_POST
-    assert fake.sent[0][0]["input"]["path"] == "/points/listApps"
+    assert fake.sent[0][0]["key"] == VmmHostFunction.PROTOCOL_API
+    assert fake.sent[0][0]["input"]["apiKey"] == "/points/listApps"
 
 
 def test_tool_point_metadata_files_include_function_schemas():
@@ -228,7 +230,7 @@ def test_master_worker_orchestrator_lifecycle_calls_run_and_terminate_vm():
     assert fake.sent[0][0]["key"] == VmmHostFunction.RUN_VM
 
     orchestrator.assign_task(worker_id=worker.worker_id, task="find recent updates", category="research")
-    assert fake.sent[1][0]["key"] == VmmHostFunction.SIGNAL_POINT
+    assert fake.sent[1][0]["key"] == VmmHostFunction.SIGNAL
 
     orchestrator.terminate_worker(worker_id=worker.worker_id)
     assert fake.sent[2][0]["key"] == VmmHostFunction.TERMINATE_VM

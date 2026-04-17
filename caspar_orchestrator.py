@@ -2,8 +2,8 @@
 
 Design goal:
 - tools are pre-running worker containers managed outside Davinci,
-- Davinci only orchestrates by signaling tool points (no runVm deployment),
-- tools send result/status back through signal points.
+- Davinci only orchestrates by signaling target machines (no runVm deployment),
+- tools send result/status back through response channels.
 """
 
 from __future__ import annotations
@@ -17,8 +17,10 @@ from typing import Any, Dict, Iterable, List, Optional
 
 @dataclass(frozen=True)
 class VmmHostFunction:
-    SIGNAL_POINT: str = "signalPoint"
+    SIGNAL: str = "signal"
     HTTP_POST: str = "httpPost"
+    PROTOCOL_API: str = "protocolApi"
+    DB_OP: str = "dbOp"
     RUN_VM: str = "runVm"
     EXEC_VM: str = "execVm"
     COPY_TO_VM: str = "copyToVm"
@@ -149,7 +151,7 @@ class CasparVmmClient:
         self.transport = transport or CasparVmmTransport()
 
     def host_call(self, key: str, input_data: Dict[str, Any]) -> Dict[str, Any]:
-        payload = {"key": key, "input": input_data}
+        payload = {"op": key, "key": key, "input": input_data}
         self.transport.send(payload=payload, callback_id=1)
         return {"ok": True, "key": key, "input": input_data}
 
@@ -171,10 +173,10 @@ class CasparVmmClient:
             "expectedResponsePoint": tool.response_point,
         }
         return self.host_call(
-            VmmHostFunction.SIGNAL_POINT,
+            VmmHostFunction.SIGNAL,
             {
-                "type": "broadcast",
-                "pointId": tool.request_point,
+                "type": "machine",
+                "machineId": tool.container.machine_id,
                 "userId": user_id,
                 "data": json.dumps(data),
             },
@@ -187,13 +189,12 @@ class CasparVmmClient:
         return results
 
     def list_point_apps(self, point_id: str) -> Dict[str, Any]:
-        """Fetch installed machines/apps/programs for a point via Caspar protocol API."""
+        """Fetch installed machines/apps/programs for a point via protocol API host call."""
         result = self.host_call(
-            VmmHostFunction.HTTP_POST,
+            VmmHostFunction.PROTOCOL_API,
             {
-                "path": "/points/listApps",
-                "data": json.dumps({"pointId": point_id}),
-                "headers": {"content-type": "application/json"},
+                "apiKey": "/points/listApps",
+                "pointId": point_id,
             },
         )
         if isinstance(result, dict) and isinstance(result.get("response"), dict):
@@ -286,10 +287,10 @@ class MasterWorkerOrchestrator:
             "expectedResponsePoint": worker.response_point,
         }
         return self.client.host_call(
-            VmmHostFunction.SIGNAL_POINT,
+            VmmHostFunction.SIGNAL,
             {
-                "type": "broadcast",
-                "pointId": worker.request_point,
+                "type": "machine",
+                "machineId": worker.machine_id,
                 "userId": user_id,
                 "data": json.dumps(data),
             },
@@ -340,10 +341,10 @@ class MasterWorkerOrchestrator:
                     tool_id=worker.worker_id,
                     vm_name=worker.vm_name,
                     category=category,
-                    host_function=VmmHostFunction.SIGNAL_POINT,
+                    host_function=VmmHostFunction.SIGNAL,
                     input_payload={
-                        "type": "broadcast",
-                        "pointId": worker.request_point,
+                        "type": "machine",
+                        "machineId": worker.machine_id,
                         "userId": "davinci-master",
                         "data": json.dumps(
                             {
@@ -594,8 +595,8 @@ class DavinciPlanner:
 
             function_name = tool.functions.get(category, "invoke")
             signal_payload = {
-                "type": "broadcast",
-                "pointId": tool.request_point,
+                "type": "machine",
+                "machineId": tool.container.machine_id,
                 "userId": "davinci-agent",
                 "data": json.dumps(
                     {
@@ -614,7 +615,7 @@ class DavinciPlanner:
                     tool_id=tool.tool_id,
                     vm_name=tool.vm_name,
                     category=category,
-                    host_function=VmmHostFunction.SIGNAL_POINT,
+                    host_function=VmmHostFunction.SIGNAL,
                     input_payload=signal_payload,
                     reason=(
                         f"Signal pre-running tool {tool.tool_id} ({function_name}) and wait for "
@@ -623,7 +624,7 @@ class DavinciPlanner:
                 )
             )
 
-        rationale = "All required categories mapped to pre-running tools via point signaling."
+        rationale = "All required categories mapped to pre-running tools via machine signaling."
         if missing:
             rationale = f"Missing capabilities: {', '.join(missing)}"
 

@@ -1,0 +1,210 @@
+"""Self-contained Caspar signalling client used by Davinci.
+
+This is the single client both the host-side deploy/test harness and the
+Davinci docker-creature use to talk to a Caspar node over its binary TCP action
+protocol. It implements:
+
+* the wire framing (no tag byte on requests; buffer+ACK flow control),
+* RSA-PSS request signing (the scheme the node verifies for external callers),
+* convenience methods for the creature lifecycle and signalling:
+  ``login``, ``create_machine_creature``, ``create_program``, ``deploy``,
+  ``run_entity``, ``read_vm_logs``, ``signal``.
+
+RSA signing needs ``pycryptodome``; everything else is stdlib. If pycryptodome
+is unavailable the client still works for unsigned/insider flows.
+"""
+
+from __future__ import annotations
+
+import base64
+import json
+import socket
+import struct
+import time
+import uuid
+from typing import Any, Dict, List, Optional, Tuple
+
+try:  # signing is only needed for authenticated external calls
+    from Crypto.PublicKey import RSA
+    from Crypto.Signature import pss
+    from Crypto.Hash import SHA256
+    _HAVE_CRYPTO = True
+except Exception:  # pragma: no cover - exercised only without the dep
+    _HAVE_CRYPTO = False
+
+
+def _lp(s: str) -> bytes:
+    b = s.encode("utf-8")
+    return struct.pack(">I", len(b)) + b
+
+
+def sign_payload(priv_pem: str, payload_bytes: bytes) -> str:
+    """RSA-PSS SHA256 signature, base64 — matches the node's verifier."""
+    if not _HAVE_CRYPTO:
+        raise RuntimeError("pycryptodome is required to sign Caspar requests")
+    key = RSA.import_key(priv_pem)
+    h = SHA256.new(payload_bytes)
+    return base64.b64encode(pss.new(key).sign(h)).decode()
+
+
+class CasparSignalingClient:
+    def __init__(self, host: str = "127.0.0.1", port: int = 8074, timeout: float = 60.0) -> None:
+        self.host = host
+        self.port = port
+        self.timeout = timeout
+        self.sock: Optional[socket.socket] = None
+        self.user_id: str = ""
+        self.priv_pem: str = ""
+
+    # -- connection ----------------------------------------------------------
+    def connect(self) -> "CasparSignalingClient":
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.sock.settimeout(self.timeout)
+        self.sock.connect((self.host, self.port))
+        return self
+
+    def close(self) -> None:
+        if self.sock:
+            try:
+                self.sock.close()
+            finally:
+                self.sock = None
+
+    def __enter__(self) -> "CasparSignalingClient":
+        return self.connect()
+
+    def __exit__(self, *_: Any) -> None:
+        self.close()
+
+    # -- low-level request ---------------------------------------------------
+    def _recvall(self, n: int) -> bytes:
+        assert self.sock is not None
+        buf = bytearray()
+        while len(buf) < n:
+            chunk = self.sock.recv(n - len(buf))
+            if not chunk:
+                raise ConnectionError("socket closed while reading")
+            buf.extend(chunk)
+        return bytes(buf)
+
+    def send(self, path: str, payload: Dict[str, Any], *, sign: bool = True) -> Dict[str, Any]:
+        if self.sock is None:
+            raise RuntimeError("not connected")
+        payload_bytes = json.dumps(payload).encode("utf-8")
+        signature = ""
+        if sign and self.priv_pem:
+            signature = sign_payload(self.priv_pem, payload_bytes)
+        pkt_id = str(uuid.uuid4())
+        body = _lp(signature) + _lp(self.user_id) + _lp(path) + _lp(pkt_id) + payload_bytes
+        self.sock.sendall(struct.pack(">I", len(body)) + body)
+
+        while True:
+            hdr = self._recvall(4)
+            length = struct.unpack(">I", hdr)[0]
+            if length == 0:
+                return {}
+            frame = self._recvall(length)
+            tag = frame[0]
+            if tag == 0x02:  # response
+                off = 1
+                pl = struct.unpack(">I", frame[off:off + 4])[0]; off += 4
+                off += pl  # skip packet id
+                res_code = struct.unpack(">I", frame[off:off + 4])[0]; off += 4
+                payload_out = frame[off:]
+                self.sock.sendall(struct.pack(">I", 1) + b"\x01")  # ACK
+                result: Dict[str, Any] = {}
+                if payload_out:
+                    try:
+                        result = json.loads(payload_out)
+                    except json.JSONDecodeError:
+                        result = {"raw": payload_out.decode("utf-8", "replace")}
+                result.setdefault("_res_code", res_code)
+                return result
+            # update/signal frames are fire-and-forget — keep reading
+            continue
+
+    # -- high-level creature lifecycle --------------------------------------
+    def login(self, username: str) -> Dict[str, Any]:
+        r = self.send("/creatures/login", {"username": username,
+                                           "emailToken": f"{username}@dev.local",
+                                           "metadata": {}}, sign=False)
+        if r.get("_res_code", -1) != 0:
+            raise RuntimeError(f"login failed: {r}")
+        self.user_id = r["user"]["id"]
+        self.priv_pem = r["privateKey"]
+        return r
+
+    def create_machine_creature(self, name: str, metadata: Optional[Dict[str, Any]] = None) -> str:
+        r = self.send("/creatures/create", {"type": "machine", "username": name[:32],
+                                            "publicKey": "", "metadata": metadata or {}})
+        if r.get("_res_code", -1) != 0:
+            raise RuntimeError(f"create machine creature failed: {r}")
+        return r["creature"]["id"]
+
+    def create_program(self, app_id: str, path: str, runtime: str, comment: str = "") -> str:
+        r = self.send("/programs/create", {"appId": app_id, "path": path,
+                                           "Comment": comment, "runtime": runtime, "publicKey": ""})
+        if r.get("_res_code", -1) != 0:
+            raise RuntimeError(f"create program failed: {r}")
+        return r.get("program", {}).get("id", "")
+
+    def deploy(self, program_id: str, entity_id: str, entity_type: str,
+               primary_b64: str, files_b64: Optional[Dict[str, str]] = None,
+               metadata: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        meta = dict(metadata or {})
+        if files_b64:
+            meta["files"] = files_b64
+        r = self.send("/programs/deploy", {"machineId": program_id, "entityId": entity_id,
+                                           "entityType": entity_type, "downloadable": False,
+                                           "payload": primary_b64, "metadata": meta})
+        if r.get("_res_code", -1) != 0:
+            raise RuntimeError(f"deploy failed: {r}")
+        return r
+
+    def run_entity(self, program_id: str, entity_id: str, *, params: Optional[Dict[str, str]] = None,
+                   ram_mb: int = 512, disk_gb: int = 1, cpu_cores: int = 1,
+                   max_exec_seconds: int = 120) -> str:
+        r = self.send("/programs/runEntity", {
+            "programId": program_id, "machineId": program_id, "entityId": entity_id,
+            "resources": {"ramMb": ram_mb, "diskGb": disk_gb, "cpuCores": cpu_cores,
+                          "maxExecTimeSeconds": max_exec_seconds},
+            "params": params or {},
+        })
+        if r.get("_res_code", -1) != 0:
+            raise RuntimeError(f"runEntity failed: {r}")
+        return r.get("vmId", "")
+
+    def read_vm_logs(self, vm_id: str, log_type: str = "", count: int = 500, offset: int = 0) -> List[Any]:
+        r = self.send("/machines/readVmLogs", {"vmId": vm_id, "logType": log_type,
+                                               "count": count, "offset": offset})
+        return r.get("logs", []) if isinstance(r, dict) else []
+
+    def signal(self, *, creature_type: str = "machine", data: Any = None,
+               creature_id: str = "", program_id: str = "", entity_id: str = "") -> Dict[str, Any]:
+        return self.send("/creatures/signal", {
+            "type": creature_type,
+            "data": data if isinstance(data, str) else json.dumps(data or {}),
+            "creatureId": creature_id, "programId": program_id, "entityId": entity_id,
+        })
+
+    # -- helpers -------------------------------------------------------------
+    def wait_for_vm_log(self, vm_id: str, marker: str, *, timeout: float = 90.0,
+                        poll: float = 2.0) -> Tuple[bool, List[Any]]:
+        """Poll VM logs until a line containing ``marker`` appears or timeout."""
+        deadline = time.time() + timeout
+        logs: List[Any] = []
+        while time.time() < deadline:
+            logs = self.read_vm_logs(vm_id)
+            if any(marker in _log_text(l) for l in logs):
+                return True, logs
+            time.sleep(poll)
+        return False, logs
+
+
+def _log_text(entry: Any) -> str:
+    if isinstance(entry, str):
+        return entry
+    if isinstance(entry, dict):
+        # VM-log rows serialize the line under "data"; fall back to other shapes.
+        return entry.get("data") or entry.get("text") or entry.get("line") or json.dumps(entry)
+    return str(entry)

@@ -187,6 +187,86 @@ class CasparSignalingClient:
             "creatureId": creature_id, "programId": program_id, "entityId": entity_id,
         })
 
+    # -- miniapp request/response over signalling ----------------------------
+    def signal_miniapp(self, *, creature_id: str, program_id: str, action: str,
+                       payload: Dict[str, Any], entity: str = "main",
+                       store_id: str = "", timeout: float = 30.0) -> Dict[str, Any]:
+        """Call a miniapp creature and await its result.
+
+        Mirrors the Decillion CLI's ``signalMiniapp``: ship a ``/creatures/signal``
+        carrying ``{action, programId, entity, correlationId, payload}`` and then
+        capture the ``creatures/signal/result`` *update* frame (tag ``0x01``) the
+        creature emits, matched by ``correlationId``.
+        """
+        correlation_id = uuid.uuid4().hex
+        data = json.dumps({"action": action, "programId": program_id, "entity": entity,
+                           "correlationId": correlation_id, "payload": payload})
+        # "pvp" is the node's program-targeted signal type: it delivers the
+        # packet to the target program (creatureId/programId) which runs its
+        # entity and signals the result back to us.
+        req = {"type": "pvp", "data": data, "creatureId": creature_id,
+               "programId": program_id, "entityId": entity, "storeId": store_id}
+        return self._signal_await_result("/creatures/signal", req, correlation_id, timeout)
+
+    def _signal_await_result(self, path: str, payload: Dict[str, Any],
+                             correlation_id: str, timeout: float) -> Dict[str, Any]:
+        if self.sock is None:
+            raise RuntimeError("not connected")
+        payload_bytes = json.dumps(payload).encode("utf-8")
+        signature = sign_payload(self.priv_pem, payload_bytes) if self.priv_pem else ""
+        pkt_id = str(uuid.uuid4())
+        body = _lp(signature) + _lp(self.user_id) + _lp(path) + _lp(pkt_id) + payload_bytes
+        self.sock.sendall(struct.pack(">I", len(body)) + body)
+
+        deadline = time.time() + timeout
+        ack: Dict[str, Any] = {}
+        old_to = self.sock.gettimeout()
+        try:
+            while time.time() < deadline:
+                self.sock.settimeout(max(0.5, deadline - time.time()))
+                try:
+                    hdr = self._recvall(4)
+                except (socket.timeout, ConnectionError):
+                    break
+                length = struct.unpack(">I", hdr)[0]
+                if length == 0:
+                    continue
+                frame = self._recvall(length)
+                tag = frame[0]
+                if tag == 0x02:  # response ack to our /creatures/signal
+                    off = 1
+                    pl = struct.unpack(">I", frame[off:off + 4])[0]; off += 4
+                    off += pl
+                    res_code = struct.unpack(">I", frame[off:off + 4])[0]; off += 4
+                    self.sock.sendall(struct.pack(">I", 1) + b"\x01")  # ACK
+                    try:
+                        ack = json.loads(frame[off:]) if frame[off:] else {}
+                    except json.JSONDecodeError:
+                        ack = {}
+                    ack["_res_code"] = res_code
+                    if res_code != 0:
+                        return {"ok": False, "error": "signal rejected", "ack": ack}
+                    continue
+                if tag == 0x01:  # update / pushed signal frame: [0x01][key][payload]
+                    off = 1
+                    klen = struct.unpack(">I", frame[off:off + 4])[0]; off += 4
+                    off += klen  # skip key
+                    try:
+                        msg = json.loads(frame[off:])
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(msg, dict) and msg.get("correlationId") == correlation_id:
+                        return {"ok": True, "result": msg}
+                    continue
+                # other tags: ignore and keep reading
+        finally:
+            try:
+                self.sock.settimeout(old_to)
+            except OSError:
+                pass
+        return {"ok": False, "error": "miniapp signal result timeout",
+                "correlationId": correlation_id, "ack": ack}
+
     # -- helpers -------------------------------------------------------------
     def wait_for_vm_log(self, vm_id: str, marker: str, *, timeout: float = 90.0,
                         poll: float = 2.0) -> Tuple[bool, List[Any]]:

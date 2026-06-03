@@ -59,15 +59,43 @@ python3 -m pytest -q                         # 26 tests
 
 Davinci's tools are deployed as **separate Caspar `docker` creatures**, and the
 Davinci creature interacts with them purely through the Caspar **signalling API**.
+The agent's reasoning is driven by a **Gemini** LLM backbone.
+
+### One-command end-to-end workflow (recommended)
+
+`scripts/e2e_workflow.sh` is the single, reproducible entrypoint. It ensures
+Docker + gVisor (`runsc`) + the `kasper` VM network are ready, brings up a
+single Caspar node (**no built-in Decillion WASM creatures** — `--skip-deploy`),
+deploys every tool **and** the agent as `docker`-container creatures, and signals
+the agent across several diverse scenarios. The Gemini API key is passed as a
+parameter and is **never written to disk or committed**.
 
 ```bash
-# 1. bring up a single Caspar node (local binary mode, skip WASM creatures)
-( cd ../caspar && ./run-nodes.sh single --no-docker --no-rebuild \
-    --skip-deploy --no-gvisor --no-firecracker )
+# pass the Gemini API key as the first argument (or via $GEMINI_API_KEY)
+./scripts/e2e_workflow.sh "<GEMINI_API_KEY>"
 
-# 2. deploy tool creatures + the davinci creature, then test the full flow
-python3 scripts/deploy_and_test.py
+# options: --tools all | --tools python_exec,web_search | --keep-running |
+#          --skip-node | --gemini-models a,b,c | --caspar-dir ../caspar
 ```
+
+### Manual (two steps)
+
+```bash
+# 1. bring up a single Caspar node (local binary mode, skip WASM creatures).
+#    gVisor stays ON: the node runs every creature under the runsc runtime.
+( cd ../caspar && ./run-nodes.sh single --no-docker --no-rebuild \
+    --skip-deploy --no-firecracker )
+
+# 2. deploy tool creatures + the davinci creature, then test the full flow.
+#    GEMINI_API_KEY selects the LLM backbone; the harness passes it to the
+#    Davinci creature's config.json (never committed).
+GEMINI_API_KEY="<key>" python3 scripts/e2e_test.py        # diverse scenarios
+GEMINI_API_KEY="<key>" python3 scripts/deploy_and_test.py # single scenario
+```
+
+The agent reaches Gemini and the tools reach the network through the
+environment's egress gateway: the harness bakes the host CA bundle into every
+creature image so TLS verification succeeds inside the sandbox.
 
 `deploy_and_test.py` performs four phases, all over the action protocol:
 

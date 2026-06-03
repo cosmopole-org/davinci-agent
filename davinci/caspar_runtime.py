@@ -223,8 +223,22 @@ def main(argv: Optional[List[str]] = None) -> int:
     else:
         registry = _build_registry()
 
+    # LLM backbone: use Gemini as the reasoner when an API key is supplied via
+    # the live config (config.json) or the GEMINI_API_KEY env var. Any failure to
+    # construct it leaves the deterministic HeuristicReasoner in place.
+    reasoner: Any = None
+    llm_provider = "heuristic"
+    try:
+        from .gemini_reasoner import reasoner_from_config
+        reasoner = reasoner_from_config(config)
+        if reasoner is not None:
+            llm_provider = "gemini:" + ",".join(reasoner.models)
+    except Exception as exc:  # noqa: BLE001 — never block boot on LLM wiring
+        print("DAVINCI_BOOT " + json.dumps({"llm_init_error": repr(exc)[:160]}), flush=True)
+
     snapshot = _capability_snapshot(registry)
     snapshot["live_signaling"] = live
+    snapshot["llm_provider"] = llm_provider
     print("DAVINCI_BOOT " + json.dumps({"task": task, "capabilities": snapshot}), flush=True)
 
     tracer = Tracer(stream=True)  # emits DAVINCI_TRACE lines as it goes
@@ -232,6 +246,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     agent = DavinciAgent(
         registry=registry,
         permissions=PermissionEngine(mode=mode, risk_ceiling=Risk.MEDIUM),
+        reasoner=reasoner,  # None -> engine default (HeuristicReasoner)
         executor=executor,
         tracer=tracer,
         budget=Budget(max_steps=int(os.environ.get("DAVINCI_MAX_STEPS", "20"))),

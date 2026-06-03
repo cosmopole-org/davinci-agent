@@ -1,0 +1,255 @@
+"""Gemini-backed reasoner — uses Google's Gemini API as the agent's LLM backbone.
+
+This is the "real LLM backend" plug-point referenced in the engine docs: it
+implements the :class:`~davinci.engine.Reasoner` protocol (``propose`` +
+``reflect``) by asking a Gemini model to choose the right tool (and arguments)
+for each plan step and to self-critique the finished plan.
+
+Design constraints:
+
+* **stdlib-only** — the agent ships in a slim container that only adds
+  ``pycryptodome``; this module therefore talks to the Gemini REST API with
+  ``urllib`` + ``ssl`` rather than the ``google-generativeai`` SDK.
+* **proxy/CA aware** — outbound HTTPS in hardened environments is intercepted by
+  an egress gateway, so the TLS context honours ``SSL_CERT_FILE`` /
+  ``GEMINI_CA_BUNDLE`` (a CA bundle baked into the image).
+* **degrade gracefully** — any network/quota/parse failure falls back to the
+  deterministic :class:`~davinci.engine.HeuristicReasoner`, so a flaky LLM never
+  breaks the agent loop. Every LLM interaction is surfaced on stdout as a
+  ``GEMINI`` sentinel line for the supervising harness.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import ssl
+import time
+import urllib.error
+import urllib.request
+from typing import Any, Dict, List, Optional
+
+from .engine import ActionProposal, HeuristicReasoner, Reflection
+from .mcp import ToolRegistry
+from .memory import WorkingMemory
+from .planning import Plan, PlanStep, StepStatus
+
+# Models tried in order — ``gemini-flash-latest`` is the stable alias that stays
+# available when a pinned snapshot is rate-limited or temporarily unavailable.
+DEFAULT_MODELS = ["gemini-flash-latest", "gemini-2.5-flash", "gemini-2.5-pro"]
+API_ROOT = "https://generativelanguage.googleapis.com/v1beta/models"
+
+
+def _ssl_context() -> ssl.SSLContext:
+    """Build a TLS context that trusts the egress-gateway CA when one is set."""
+    cafile = os.environ.get("GEMINI_CA_BUNDLE") or os.environ.get("SSL_CERT_FILE")
+    if cafile and os.path.isfile(cafile):
+        return ssl.create_default_context(cafile=cafile)
+    # ``create_default_context`` already honours SSL_CERT_FILE/SSL_CERT_DIR via
+    # the OpenSSL default paths; this is the generic fallback.
+    return ssl.create_default_context()
+
+
+class GeminiReasoner:
+    """A :class:`Reasoner` that drives tool selection with a Gemini model."""
+
+    def __init__(self, api_key: str, *, models: Optional[List[str]] = None,
+                 temperature: float = 0.2, timeout: int = 40,
+                 max_retries: int = 3) -> None:
+        if not api_key:
+            raise ValueError("GeminiReasoner requires a non-empty api_key")
+        self.api_key = api_key
+        self.models = models or list(DEFAULT_MODELS)
+        self.temperature = temperature
+        self.timeout = timeout
+        self.max_retries = max_retries
+        self._ctx = _ssl_context()
+        self._fallback = HeuristicReasoner()
+        self.active_model: Optional[str] = None
+
+    # -- LLM transport -------------------------------------------------------
+    def _generate(self, prompt: str, *, system: str = "") -> Optional[str]:
+        """POST one prompt to Gemini, trying each model + retrying transient 5xx."""
+        body: Dict[str, Any] = {
+            "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+            "generationConfig": {"temperature": self.temperature,
+                                  "responseMimeType": "application/json"},
+        }
+        if system:
+            body["systemInstruction"] = {"parts": [{"text": system}]}
+        payload = json.dumps(body).encode()
+
+        for model in self.models:
+            url = f"{API_ROOT}/{model}:generateContent?key={self.api_key}"
+            for attempt in range(self.max_retries):
+                try:
+                    req = urllib.request.Request(
+                        url, data=payload,
+                        headers={"Content-Type": "application/json"}, method="POST")
+                    with urllib.request.urlopen(req, timeout=self.timeout, context=self._ctx) as resp:
+                        data = json.loads(resp.read().decode())
+                    text = self._extract_text(data)
+                    if text:
+                        self.active_model = model
+                        return text
+                    break  # 200 but empty/blocked — try next model
+                except urllib.error.HTTPError as exc:
+                    code = exc.code
+                    # 429 = quota/rate limit: retrying the *same* model rarely
+                    # clears within the loop, so fall straight through to the
+                    # next model. 500/503 are transient — retry with backoff.
+                    if code in (500, 503) and attempt < self.max_retries - 1:
+                        time.sleep(1.5 * (attempt + 1))
+                        continue
+                    _emit("http_error", model=model, code=code)
+                    break  # non-retryable / quota / exhausted — next model
+                except Exception as exc:  # noqa: BLE001 — network/TLS/timeout
+                    if attempt < self.max_retries - 1:
+                        time.sleep(1.0 * (attempt + 1))
+                        continue
+                    _emit("transport_error", model=model, error=repr(exc)[:160])
+                    break
+        return None
+
+    @staticmethod
+    def _extract_text(data: Dict[str, Any]) -> str:
+        for cand in data.get("candidates", []) or []:
+            for part in cand.get("content", {}).get("parts", []) or []:
+                if isinstance(part.get("text"), str) and part["text"].strip():
+                    return part["text"]
+        return ""
+
+    @staticmethod
+    def _parse_json(text: str) -> Optional[Dict[str, Any]]:
+        text = text.strip()
+        if text.startswith("```"):
+            text = text.split("\n", 1)[-1].rsplit("```", 1)[0]
+        try:
+            obj = json.loads(text)
+            return obj if isinstance(obj, dict) else None
+        except (json.JSONDecodeError, ValueError):
+            # Last resort: grab the outermost {...} span.
+            start, end = text.find("{"), text.rfind("}")
+            if 0 <= start < end:
+                try:
+                    return json.loads(text[start:end + 1])
+                except (json.JSONDecodeError, ValueError):
+                    return None
+            return None
+
+    # -- Reasoner protocol ---------------------------------------------------
+    def propose(self, objective: str, step: PlanStep, registry: ToolRegistry,
+                memory: WorkingMemory) -> ActionProposal:
+        catalog = [t.stub() for t in registry.all()]
+        system = (
+            "You are Davinci, an enterprise agent planner. For the CURRENT step you "
+            "pick exactly one registered tool to advance the objective, or no tool for "
+            "pure-cognition (analysis/synthesis/verification) steps. Always reply with "
+            "a single JSON object: {\"tool\": <tool name or null>, \"args\": {object}, "
+            "\"thought\": <short reason>, \"final_answer\": <string or null>}. "
+            "Choose the least-risk tool that fits the step's category. Put the working "
+            "instruction for the tool in args.task."
+        )
+        prompt = json.dumps({
+            "objective": objective,
+            "current_step": {"title": step.title, "category": step.category,
+                             "rationale": step.rationale},
+            "available_tools": catalog,
+            "recent_memory": self._memory_digest(memory),
+        }, indent=2)
+
+        text = self._generate(prompt, system=system)
+        decision = self._parse_json(text) if text else None
+        if not decision:
+            _emit("propose_fallback", step=step.title)
+            return self._fallback.propose(objective, step, registry, memory)
+
+        thought = str(decision.get("thought") or f"[gemini:{self.active_model}] {step.title}")
+        final_answer = decision.get("final_answer")
+        if isinstance(final_answer, str) and final_answer.strip():
+            _emit("propose", model=self.active_model, step=step.title, decision="final_answer")
+            return ActionProposal(tool=None, thought=thought, final_answer=final_answer.strip())
+
+        tool_name = decision.get("tool")
+        tool = registry.get(tool_name) if isinstance(tool_name, str) else None
+        if tool_name and not tool:
+            # Model named a tool that isn't in the registry — recover by search.
+            matches = registry.search(str(tool_name), max_results=1)
+            tool = matches[0] if matches else None
+        args = decision.get("args") if isinstance(decision.get("args"), dict) else {}
+        args.setdefault("task", objective)
+        args.setdefault("step", step.title)
+        _emit("propose", model=self.active_model, step=step.title,
+              tool=tool.name if tool else None)
+        return ActionProposal(tool=tool, args=args, thought=thought)
+
+    def reflect(self, objective: str, plan: Plan, memory: WorkingMemory) -> Reflection:
+        # A hard failure always warrants a heuristic-style replan signal; ask the
+        # model to judge satisfaction and (when unsatisfied) propose next steps.
+        system = (
+            "You are Davinci's reflection critic. Given the objective and the executed "
+            "plan, decide whether the objective is satisfied. Reply with a single JSON "
+            "object: {\"satisfied\": bool, \"critique\": <short string>, "
+            "\"replan_titles\": [<step titles to retry/add>]}."
+        )
+        prompt = json.dumps({
+            "objective": objective,
+            "plan": plan.to_dict(),
+            "tool_results": self._memory_digest(memory, roles=("tool_result",)),
+        }, indent=2)
+        text = self._generate(prompt, system=system)
+        decision = self._parse_json(text) if text else None
+        if not decision:
+            _emit("reflect_fallback")
+            return self._fallback.reflect(objective, plan, memory)
+
+        satisfied = bool(decision.get("satisfied")) and not plan.has_failures
+        titles = decision.get("replan_titles") or []
+        titles = [str(t) for t in titles if str(t).strip()][:4]
+        if not satisfied and not titles and plan.has_failures:
+            titles = [f"Retry: {s.title}" for s in plan.steps
+                      if s.status == StepStatus.FAILED]
+        _emit("reflect", model=self.active_model, satisfied=satisfied)
+        return Reflection(satisfied=satisfied,
+                          critique=str(decision.get("critique") or ""),
+                          replan_titles=titles)
+
+    # -- helpers -------------------------------------------------------------
+    @staticmethod
+    def _memory_digest(memory: WorkingMemory, *, roles: tuple = (),
+                       limit: int = 8) -> List[Dict[str, str]]:
+        items = getattr(memory, "items", []) or []
+        out: List[Dict[str, str]] = []
+        for entry in items[-limit:]:
+            role = entry.get("role", "")
+            if roles and role not in roles:
+                continue
+            content = entry.get("content")
+            text = content if isinstance(content, str) else json.dumps(content)[:400]
+            out.append({"role": role, "content": text[:400]})
+        return out
+
+
+def _emit(event: str, **data: Any) -> None:
+    """Greppable, secret-free trace line for the supervising harness."""
+    try:
+        print("GEMINI " + json.dumps({"event": event, **data}), flush=True)
+    except Exception:  # pragma: no cover — never let tracing break the loop
+        pass
+
+
+def reasoner_from_config(config: Dict[str, Any]) -> Optional[GeminiReasoner]:
+    """Construct a GeminiReasoner from a config/env, or ``None`` if no key.
+
+    The API key is read from the live ``config.json`` (key ``gemini_api_key`` or
+    nested ``gemini.api_key``) or the ``GEMINI_API_KEY`` env var — it is never
+    hard-coded or committed.
+    """
+    gemini = config.get("gemini") if isinstance(config.get("gemini"), dict) else {}
+    api_key = (config.get("gemini_api_key") or gemini.get("api_key")
+               or os.environ.get("GEMINI_API_KEY") or "").strip()
+    if not api_key:
+        return None
+    models = (config.get("gemini_models") or gemini.get("models")
+              or ([os.environ["GEMINI_MODEL"]] if os.environ.get("GEMINI_MODEL") else None))
+    return GeminiReasoner(api_key, models=models)

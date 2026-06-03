@@ -30,6 +30,7 @@ import subprocess
 import sys
 import tarfile
 import time
+import uuid
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -37,13 +38,49 @@ sys.path.insert(0, str(REPO))
 
 from davinci.caspar_signaling import CasparSignalingClient, _log_text  # noqa: E402
 
+# A short per-run tag keeps machine-creature usernames unique so the harness can
+# be re-run against a node that already persisted creatures from a prior run
+# (the node rejects duplicate creature usernames). Override with CASPAR_RUN_TAG.
+RUN_TAG = os.environ.get("CASPAR_RUN_TAG") or uuid.uuid4().hex[:8]
+
 NODE_HOST = os.environ.get("CASPAR_NODE_HOST", "127.0.0.1")
 NODE_PORT = int(os.environ.get("CASPAR_NODE_PORT", "8074"))
 # Address the *creature* uses to reach the node from inside the docker network.
-NODE_HOST_FROM_VM = os.environ.get("CASPAR_NODE_HOST_FROM_VM", "172.17.0.1")
+# Defaults to the ``kasper`` bridge gateway the node attaches creatures to.
+NODE_HOST_FROM_VM = os.environ.get("CASPAR_NODE_HOST_FROM_VM", "172.18.0.1")
 ADMIN_USER = "davinci_admin"
 
+# LLM backbone — the Gemini API key is taken from the environment only, never
+# hard-coded or committed. When set, it is passed to the Davinci creature via
+# its config.json so the agent reasons with Gemini.
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
+GEMINI_MODELS = [m.strip() for m in os.environ.get("GEMINI_MODELS", "").split(",") if m.strip()]
+
+# In hardened environments outbound HTTPS is intercepted by an egress gateway
+# whose CA must be trusted inside the creature containers (otherwise Gemini /
+# web tools fail TLS verification). We ship the host CA bundle into each image.
+CA_BUNDLE_PATH = os.environ.get("CASPAR_CA_BUNDLE", "/etc/ssl/certs/ca-certificates.crt")
+
 TOOLS_DIR = REPO / "tools"
+
+
+def _ca_bundle_bytes():
+    """Read the host CA bundle (incl. egress-gateway CAs), or ``None``."""
+    try:
+        data = Path(CA_BUNDLE_PATH).read_bytes()
+        return data if data.strip() else None
+    except OSError:
+        return None
+
+
+# Appended to every creature Dockerfile so the egress-gateway CA is trusted and
+# the standard TLS env vars point at the baked-in bundle (Python, requests, Node).
+CA_DOCKERFILE_SNIPPET = (
+    "COPY ca-certificates.crt /app/ca-certificates.crt\n"
+    "ENV SSL_CERT_FILE=/app/ca-certificates.crt "
+    "REQUESTS_CA_BUNDLE=/app/ca-certificates.crt "
+    "NODE_EXTRA_CA_CERTS=/app/ca-certificates.crt\n"
+)
 
 
 def _discover_tools() -> list:
@@ -159,7 +196,7 @@ def davinci_bundle_tar() -> bytes:
 def deploy_tool(c: CasparSignalingClient, tool: dict) -> dict:
     tid = tool["tool_id"]
     tool_dir = REPO / "tools" / tid
-    machine_id = c.create_machine_creature(f"m-tool-{tid}")
+    machine_id = c.create_machine_creature(f"m-tool-{tid}-{RUN_TAG}")
     program_id = c.create_program(machine_id, f"/tools/{tid}", "docker", f"tool {tid}")
 
     # Build context: the shared runtime + the tool's real implementation, plus
@@ -176,6 +213,13 @@ def deploy_tool(c: CasparSignalingClient, tool: dict) -> dict:
     # back to the generic stdlib-only Dockerfile for any tool without one.
     dockerfile_path = tool_dir / "Dockerfile"
     dockerfile = dockerfile_path.read_bytes() if dockerfile_path.exists() else TOOL_DOCKERFILE.encode()
+
+    # Trust the egress-gateway CA inside the image so network tools can make
+    # outbound HTTPS calls through the intercepting proxy.
+    ca = _ca_bundle_bytes()
+    if ca is not None:
+        files["ca-certificates.crt"] = b64_bytes(ca)
+        dockerfile = dockerfile + b"\n" + CA_DOCKERFILE_SNIPPET.encode()
 
     c.deploy(program_id, tid, "docker", b64_bytes(dockerfile), files_b64=files)
     if not wait_for_image(program_id, tid, timeout=BUILD_TIMEOUT.get(tid, 300)):
@@ -208,10 +252,15 @@ def signal_tool(c: CasparSignalingClient, rec: dict) -> bool:
 
 
 def deploy_davinci(c: CasparSignalingClient) -> dict:
-    machine_id = c.create_machine_creature("m-davinci-agent")
+    machine_id = c.create_machine_creature(f"m-davinci-agent-{RUN_TAG}")
     program_id = c.create_program(machine_id, "/davinci", "docker", "davinci agent")
     files = {"bundle.tar": b64_bytes(davinci_bundle_tar())}
-    c.deploy(program_id, "davinci", "docker", b64_bytes(DAVINCI_DOCKERFILE.encode()), files_b64=files)
+    dockerfile = DAVINCI_DOCKERFILE
+    ca = _ca_bundle_bytes()
+    if ca is not None:
+        files["ca-certificates.crt"] = b64_bytes(ca)
+        dockerfile = dockerfile + CA_DOCKERFILE_SNIPPET
+    c.deploy(program_id, "davinci", "docker", b64_bytes(dockerfile.encode()), files_b64=files)
     if not wait_for_image(program_id, "davinci", timeout=360):
         raise RuntimeError("davinci image not built in time")
     ok(f"davinci creature deployed: program={program_id}")
@@ -224,6 +273,10 @@ def signal_davinci(c: CasparSignalingClient, davinci: dict, tool_recs: list) -> 
             "required_categories": [t["category"] for t in tool_recs]}
     config = {"node_host": NODE_HOST_FROM_VM, "node_port": NODE_PORT,
               "username": ADMIN_USER,
+              # LLM backbone for the agent's reasoning (Gemini). Key comes from
+              # the environment of *this* harness only — never committed.
+              "gemini_api_key": GEMINI_API_KEY,
+              "gemini_models": GEMINI_MODELS or None,
               "tools": [{"name": t["name"], "tool_id": t["tool_id"], "category": t["category"],
                          "risk": t["risk"], "description": t["description"],
                          "program_id": t["program_id"], "entity_id": t["entity_id"],

@@ -1,0 +1,2 @@
+requests>=2.31
+ddgs>=6.0

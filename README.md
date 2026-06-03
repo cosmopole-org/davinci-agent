@@ -82,7 +82,30 @@ python3 scripts/deploy_and_test.py
 
 A tool creature reads its signal from `/app/input/task.json`
 (`{tool_id, function, payload}`) and emits one line `TOOL_RESPONSE <json>` on
-stdout (captured as VM logs). See `tools/_runtime/tool_runtime.py`.
+stdout (captured as VM logs). The shared runtime (`tools/_runtime/tool_runtime.py`)
+loads the tool's own `tool.py` and dispatches to its `invoke()`.
+
+### Tools (real implementations)
+
+Every tool is a full implementation, not a stub. Each ships its own
+`Dockerfile` + `requirements.txt`; the deploy harness builds each image with the
+tool's real dependencies and the shared runtime.
+
+| tool | function | what it does | key deps / credentials |
+|------|----------|--------------|------------------------|
+| `python_exec` | `execute` | runs Python in an isolated subprocess (timeout, rlimits, captured stdio, `result`) | numpy, pandas |
+| `web_search` | `search` | web search via Tavily/Brave/SerpApi/Google CSE, DuckDuckGo fallback | `TAVILY_API_KEY` etc. (optional) |
+| `fetch_url` | `fetch` | HTTP fetch + readable HTML/JSON extraction | requests, beautifulsoup4 |
+| `vector_search` | `vector_search` | persistent semantic index + cosine search | scikit-learn (hashing) / sentence-transformers / OpenAI |
+| `sql_query` | `query` | SQL via SQLAlchemy (SQLite/Postgres/MySQL) | `DATABASE_URL` (defaults to local SQLite) |
+| `git_tool` | `status_commit`, `open_pr` | real git status/commit + GitHub PR creation | git, `GITHUB_TOKEN` |
+| `browser_automation` | `automate` | headless Chromium/Firefox/WebKit via Playwright | Playwright base image |
+| `slack_connector` | `slack_action` | Slack Web API (post/history/upload/…) | `SLACK_BOT_TOKEN` |
+| `jira_connector` | `jira_action` | Jira Cloud REST v3 (issues/JQL/transitions) | `JIRA_URL`/`JIRA_EMAIL`/`JIRA_API_TOKEN` |
+| `calendar_connector` | `calendar_action` | Google Calendar / CalDAV / `.ics` generation | Google SA / CalDAV creds (ICS works offline) |
+
+Connectors that need credentials return a clear `{ok: false, error}` when they
+are absent — the call path itself is fully real.
 
 ## Repository layout
 

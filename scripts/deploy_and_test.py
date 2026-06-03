@@ -43,15 +43,39 @@ NODE_PORT = int(os.environ.get("CASPAR_NODE_PORT", "8074"))
 NODE_HOST_FROM_VM = os.environ.get("CASPAR_NODE_HOST_FROM_VM", "172.17.0.1")
 ADMIN_USER = "davinci_admin"
 
-# Tool creatures to deploy. category/risk drive Davinci's planner + permissions.
-TOOLS = [
-    {"tool_id": "web_search", "category": "web_research", "risk": "low",
-     "description": "Search the web for current information", "requires_network": True},
-    {"tool_id": "vector_search", "category": "knowledge_retrieval", "risk": "low",
-     "description": "Retrieve documents from a knowledge base"},
-    {"tool_id": "python_exec", "category": "execution", "risk": "medium",
-     "description": "Execute Python code in a sandbox"},
-]
+TOOLS_DIR = REPO / "tools"
+
+
+def _discover_tools() -> list:
+    """Build the tool-creature catalog from each tool's point.metadata.json.
+
+    category/risk/requires_network drive Davinci's planner + permissions; the
+    route function is taken from the metadata ``routes`` map (falling back to
+    ``invoke``) so the live creature signals each tool with its real function.
+    """
+    tools = []
+    for meta_path in sorted(TOOLS_DIR.glob("*/point.metadata.json")):
+        meta = json.loads(meta_path.read_text())
+        cats = meta.get("categories") or ["general"]
+        routes = meta.get("routes") or {}
+        function = routes.get(cats[0], "invoke")
+        tools.append({
+            "tool_id": meta["tool_id"],
+            "category": cats[0],
+            "risk": meta.get("risk_level", "medium"),
+            "description": meta.get("description", meta["tool_id"]),
+            "requires_network": bool(meta.get("requires_network", False)),
+            "function": function,
+        })
+    return tools
+
+
+# Tool creatures to deploy (every tool under tools/ with metadata).
+TOOLS = _discover_tools()
+
+# Heavier images (system packages / browser binaries) need a longer build window.
+BUILD_TIMEOUT = {"browser_automation": 900, "sql_query": 480, "vector_search": 480,
+                 "calendar_connector": 480}
 
 GREEN, RED, CYAN, NC = "\033[0;32m", "\033[0;31m", "\033[0;36m", "\033[0m"
 
@@ -94,6 +118,7 @@ def wait_for_image(program_id: str, entity_id: str, timeout: int = 240) -> bool:
 # Build contexts
 # --------------------------------------------------------------------------- #
 
+# Fallback Dockerfile for a tool that ships no Dockerfile of its own.
 TOOL_DOCKERFILE = (
     "FROM public.ecr.aws/docker/library/python:3.12-slim\n"
     "WORKDIR /app\nCOPY . /app\n"
@@ -133,14 +158,27 @@ def davinci_bundle_tar() -> bytes:
 
 def deploy_tool(c: CasparSignalingClient, tool: dict) -> dict:
     tid = tool["tool_id"]
+    tool_dir = REPO / "tools" / tid
     machine_id = c.create_machine_creature(f"m-tool-{tid}")
     program_id = c.create_program(machine_id, f"/tools/{tid}", "docker", f"tool {tid}")
-    tool_py = REPO / "tools" / tid / "tool.py"
+
+    # Build context: the shared runtime + the tool's real implementation, plus
+    # its requirements.txt so the tool's own Dockerfile can install its deps.
     files = {"tool_runtime.py": b64_file(REPO / "tools" / "_runtime" / "tool_runtime.py")}
+    tool_py = tool_dir / "tool.py"
     if tool_py.exists():
         files["tool.py"] = b64_file(tool_py)
-    c.deploy(program_id, tid, "docker", b64_bytes(TOOL_DOCKERFILE.encode()), files_b64=files)
-    if not wait_for_image(program_id, tid):
+    reqs = tool_dir / "requirements.txt"
+    if reqs.exists():
+        files["requirements.txt"] = b64_file(reqs)
+
+    # Prefer the tool's own Dockerfile (installs its real dependencies); fall
+    # back to the generic stdlib-only Dockerfile for any tool without one.
+    dockerfile_path = tool_dir / "Dockerfile"
+    dockerfile = dockerfile_path.read_bytes() if dockerfile_path.exists() else TOOL_DOCKERFILE.encode()
+
+    c.deploy(program_id, tid, "docker", b64_bytes(dockerfile), files_b64=files)
+    if not wait_for_image(program_id, tid, timeout=BUILD_TIMEOUT.get(tid, 300)):
         raise RuntimeError(f"image for tool {tid} not built in time")
     rec = dict(tool); rec.update({"machine_id": machine_id, "program_id": program_id,
                                   "entity_id": tid, "name": f"caspar__{tid}"})
@@ -150,9 +188,14 @@ def deploy_tool(c: CasparSignalingClient, tool: dict) -> dict:
 
 def signal_tool(c: CasparSignalingClient, rec: dict) -> bool:
     tid = rec["tool_id"]
-    signal = {"tool_id": tid, "function": "invoke",
+    # A broad payload so each tool can find the field it needs; tools ignore
+    # the rest. Connectors with no creds still emit a (failing) TOOL_RESPONSE,
+    # which is what the smoke test asserts on.
+    signal = {"tool_id": tid, "function": rec.get("function", "invoke"),
               "payload": {"task": f"smoke-test {tid}", "query": "davinci caspar",
-                          "url": "https://example.com", "code": "result = 6*7"}}
+                          "url": "https://example.com", "ignore_https_errors": True,
+                          "code": "result = 6*7", "sql": "SELECT 1 AS one",
+                          "documents": ["davinci orchestrates caspar creatures"]}}
     vm_id = c.run_entity(rec["program_id"], rec["entity_id"],
                          params={"task.json": json.dumps(signal)}, ram_mb=256, max_exec_seconds=60)
     found, logs = c.wait_for_vm_log(vm_id, "TOOL_RESPONSE", timeout=90)
@@ -184,6 +227,7 @@ def signal_davinci(c: CasparSignalingClient, davinci: dict, tool_recs: list) -> 
               "tools": [{"name": t["name"], "tool_id": t["tool_id"], "category": t["category"],
                          "risk": t["risk"], "description": t["description"],
                          "program_id": t["program_id"], "entity_id": t["entity_id"],
+                         "function": t.get("function", "invoke"),
                          "requires_network": t.get("requires_network", False)}
                         for t in tool_recs]}
     vm_id = c.run_entity(davinci["program_id"], "davinci",

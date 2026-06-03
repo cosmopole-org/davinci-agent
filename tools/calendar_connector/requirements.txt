@@ -1,0 +1,4 @@
+icalendar>=5.0
+caldav>=1.3
+google-api-python-client>=2.120
+google-auth>=2.29

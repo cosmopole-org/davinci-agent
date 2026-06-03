@@ -8,9 +8,13 @@ Contract:
     input  : /app/input/task.json = {"tool_id","function","payload"}
     output : a single line  ``TOOL_RESPONSE <json>``  on stdout
 
-The runtime dispatches to a built-in handler for well-known tools (so the demo
-does real work where it safely can), and otherwise falls back to the tool's own
-``invoke`` function deployed alongside it.
+Dispatch order:
+    1. The tool's own deployed ``tool.py`` ``invoke`` (the real implementation,
+       shipped alongside this runtime with its own dependencies installed in the
+       tool image). This is what runs in production.
+    2. A small built-in fallback for a few well-known tools, so the runtime is
+       still useful when no ``tool.py`` is present (e.g. unit tests).
+    3. An echo, so an unknown tool never hard-fails.
 """
 
 from __future__ import annotations
@@ -37,7 +41,7 @@ def _read_signal() -> dict:
 
 
 # --------------------------------------------------------------------------- #
-# Built-in handlers (lightweight but real where safe)
+# Built-in fallback handlers (used only when no real tool.py is deployed)
 # --------------------------------------------------------------------------- #
 
 def _h_python_exec(payload: dict) -> dict:
@@ -64,8 +68,6 @@ def _h_http(payload: dict) -> dict:
         except Exception as exc:
             out.update({"ok": False, "url": url, "error": str(exc)})
 
-    # Bound the whole call (DNS resolution can hang past the socket timeout in a
-    # sandbox with no resolver); never let a tool creature block its response.
     import threading
     t = threading.Thread(target=_fetch, daemon=True)
     t.start()
@@ -100,23 +102,41 @@ _BUILTINS = {
 }
 
 
+def _load_tool_module():
+    """Import the deployed ``tool.py`` (the real per-tool implementation)."""
+    try:
+        import tool  # type: ignore
+        return tool
+    except Exception:
+        return None
+
+
+def _call_invoke(impl, function: str, payload: dict) -> dict:
+    """Call a tool's invoke() supporting both (function, payload) and (payload)."""
+    try:
+        return impl.invoke(function, payload)  # type: ignore[misc]
+    except TypeError:
+        return impl.invoke(payload)  # type: ignore[misc]
+
+
 def _dispatch(tool_id: str, function: str, payload: dict) -> dict:
+    # 1. Prefer the tool's real implementation when it ships with the image.
+    impl = _load_tool_module()
+    if impl is not None and hasattr(impl, "invoke"):
+        try:
+            return _call_invoke(impl, function, payload)
+        except Exception:
+            return {"ok": False, "error": traceback.format_exc().splitlines()[-1]}
+
+    # 2. Built-in fallback for well-known tools.
     handler = _BUILTINS.get(tool_id)
     if handler:
         try:
             return handler(payload)  # type: ignore[arg-type]
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
-    # Fall back to the deployed tool.py invoke(), supporting both signatures.
-    try:
-        import tool  # type: ignore
-        if hasattr(tool, "invoke"):
-            try:
-                return tool.invoke(function, payload)  # type: ignore[misc]
-            except TypeError:
-                return tool.invoke(payload)  # type: ignore[misc]
-    except Exception:
-        pass
+
+    # 3. Echo so unknown tools never hard-fail.
     return _h_echo(tool_id, payload)
 
 
@@ -131,7 +151,7 @@ def main() -> int:
     except Exception:
         result = {"ok": False, "error": traceback.format_exc().splitlines()[-1]}
     response = {"tool_id": tool_id, "function": function, "result": result}
-    print("TOOL_RESPONSE " + json.dumps(response), flush=True)
+    print("TOOL_RESPONSE " + json.dumps(response, default=str), flush=True)
     return 0
 
 

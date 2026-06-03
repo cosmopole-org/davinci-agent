@@ -1,0 +1,3 @@
+# Scientific stack available to executed code.
+numpy>=1.26
+pandas>=2.1

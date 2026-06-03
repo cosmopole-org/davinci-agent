@@ -140,15 +140,32 @@ class GeminiReasoner:
     # -- Reasoner protocol ---------------------------------------------------
     def propose(self, objective: str, step: PlanStep, registry: ToolRegistry,
                 memory: WorkingMemory) -> ActionProposal:
-        catalog = [t.stub() for t in registry.all()]
+        # Include each tool's input schema so the model emits arguments that match
+        # the tool's real contract (this is what makes Path A / schema-rich
+        # discovery pay off — e.g. python_exec wants `code`, web_search `query`).
+        catalog = []
+        for t in registry.all():
+            entry = t.stub()
+            try:
+                schema = t.schema()
+            except Exception:  # noqa: BLE001
+                schema = {}
+            props = (schema or {}).get("properties") if isinstance(schema, dict) else None
+            if props:
+                entry["arg_schema"] = props
+                entry["required_args"] = (schema or {}).get("required", [])
+            catalog.append(entry)
         system = (
             "You are Davinci, an enterprise agent planner. For the CURRENT step you "
             "pick exactly one registered tool to advance the objective, or no tool for "
             "pure-cognition (analysis/synthesis/verification) steps. Always reply with "
             "a single JSON object: {\"tool\": <tool name or null>, \"args\": {object}, "
             "\"thought\": <short reason>, \"final_answer\": <string or null>}. "
-            "Choose the least-risk tool that fits the step's category. Put the working "
-            "instruction for the tool in args.task."
+            "Choose the least-risk tool that fits the step's category. CRITICAL: fill "
+            "\"args\" using the chosen tool's \"arg_schema\" (use those exact property "
+            "names and types) — e.g. provide runnable code for a code arg, a real query "
+            "string for a query arg. Only fall back to a generic args.task when the tool "
+            "exposes no arg_schema."
         )
         prompt = json.dumps({
             "objective": objective,

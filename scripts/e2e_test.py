@@ -94,30 +94,90 @@ SCENARIOS = [
 ]
 
 
-def _gemini_config(tool_recs: list) -> dict:
-    return {
+def _gemini_config(tool_recs: list, store_cfg: dict = None) -> dict:
+    cfg = {
         "node_host": dt.NODE_HOST_FROM_VM, "node_port": dt.NODE_PORT,
         "username": dt.ADMIN_USER,
         "gemini_api_key": dt.GEMINI_API_KEY,
         "gemini_models": dt.GEMINI_MODELS or None,
-        "tools": [{"name": t["name"], "tool_id": t["tool_id"], "category": t["category"],
-                   "risk": t["risk"], "description": t["description"],
-                   "program_id": t["program_id"], "entity_id": t["entity_id"],
-                   "function": t.get("function", "invoke"),
-                   "requires_network": t.get("requires_network", False)}
-                  for t in tool_recs],
     }
+    if store_cfg:
+        # Path A: Davinci discovers tools by listing the store's MCP machines.
+        cfg["store"] = store_cfg
+    else:
+        # Fallback: a pre-resolved (schema-less) catalog.
+        cfg["tools"] = [{"name": t["name"], "tool_id": t["tool_id"], "category": t["category"],
+                         "risk": t["risk"], "description": t["description"],
+                         "program_id": t["program_id"], "entity_id": t["entity_id"],
+                         "function": t.get("function", "invoke"),
+                         "requires_network": t.get("requires_network", False)}
+                        for t in tool_recs]
+    return cfg
+
+
+# --------------------------------------------------------------------------- #
+# Store (space) setup — Path A discovery substrate
+# --------------------------------------------------------------------------- #
+
+STORES_WASM = os.environ.get(
+    "STORES_WASM",
+    str((REPO.parent / "decillionai-server" / "wasm" / "stores.wasm")))
+
+
+def setup_store(c: CasparSignalingClient, tool_recs: list) -> dict:
+    """Deploy the stores miniapp, create a store, and add each tool as a machine
+    in it (carrying its MCP manifest). Returns the store discovery config for
+    Davinci, or ``{}`` if the stores creature isn't available."""
+    wasm = Path(STORES_WASM)
+    if not wasm.exists():
+        warn(f"stores.wasm not found at {wasm} — skipping store (Path A unavailable)")
+        return {}
+    stores = dt.deploy_wasm_creature(c, "stores", wasm, entity_id="main")
+    target = {"creature_id": stores["machine_id"], "program_id": stores["program_id"],
+              "entity": "main"}
+
+    # Create a store (space) for the Davinci tool catalog.
+    resp = c.signal_miniapp(creature_id=target["creature_id"], program_id=target["program_id"],
+                            entity="main", action="create",
+                            payload={"isPublic": True, "persHist": False,
+                                     "origin": "davinci-tools", "metadata": {"name": "davinci-tools"}})
+    store_id = ""
+    if resp.get("ok"):
+        res = resp.get("result", {})
+        store_id = res.get("storeId") or (res.get("host") or {}).get("storeId") or ""
+    if not store_id:
+        warn(f"could not create store: {resp}")
+        return {}
+    ok(f"created store {store_id}")
+
+    # Add each deployed tool program to the store with its full MCP manifest.
+    added = 0
+    for t in tool_recs:
+        meta = dt.tool_full_metadata(t["tool_id"])
+        meta = dict(meta)
+        meta["program_id"] = t["program_id"]
+        meta["entity_id"] = t["entity_id"]
+        r = c.signal_miniapp(creature_id=target["creature_id"], program_id=target["program_id"],
+                             entity="main", action="addMachine", store_id=store_id,
+                             payload={"storeId": store_id, "programId": t["program_id"],
+                                      "machineId": t["machine_id"], "metadata": meta})
+        if r.get("ok"):
+            added += 1
+        else:
+            warn(f"addMachine {t['tool_id']} failed: {r.get('error')}")
+    ok(f"added {added}/{len(tool_recs)} tools to store {store_id}")
+    return {**target, "store_id": store_id}
 
 
 def run_scenario(c: CasparSignalingClient, davinci: dict, tool_recs: list,
-                 scenario: dict) -> dict:
+                 scenario: dict, store_cfg: dict = None) -> dict:
     """Signal the Davinci creature for one scenario and assert the outcome."""
     name = scenario["name"]
     # Only require categories we actually deployed, so the plan is satisfiable.
     have = {t["category"] for t in tool_recs}
     required = [cat for cat in scenario["categories"] if cat in have] or list(have)[:2]
     task = {"objective": scenario["objective"], "required_categories": required}
-    config = _gemini_config(tool_recs)
+    config = _gemini_config(tool_recs, store_cfg=store_cfg)
 
     info(f"scenario '{name}': required={required}")
     vm_id = c.run_entity(davinci["program_id"], "davinci",
@@ -129,10 +189,20 @@ def run_scenario(c: CasparSignalingClient, davinci: dict, tool_recs: list,
 
     boot = next((t for t in texts if "DAVINCI_BOOT" in t and "capabilities" in t), "")
     provider = "unknown"
+    discovery = "unknown"
     if boot:
         try:
-            provider = json.loads(boot.split("DAVINCI_BOOT", 1)[1]) \
-                .get("capabilities", {}).get("llm_provider", "unknown")
+            caps = json.loads(boot.split("DAVINCI_BOOT", 1)[1]).get("capabilities", {})
+            provider = caps.get("llm_provider", "unknown")
+            discovery = caps.get("discovery", "unknown")
+        except Exception:
+            pass
+    # Discovery sentinel: how many MCP machines Davinci listed from the store.
+    disc_line = next((t for t in texts if "DAVINCI_DISCOVERY" in t), "")
+    discovered = 0
+    if disc_line:
+        try:
+            discovered = json.loads(disc_line.split("DAVINCI_DISCOVERY", 1)[1]).get("registered", 0)
         except Exception:
             pass
     gemini_calls = sum(1 for t in texts if t.lstrip().startswith("GEMINI ")
@@ -154,12 +224,18 @@ def run_scenario(c: CasparSignalingClient, davinci: dict, tool_recs: list,
 
     tool_calls = int(result.get("budget", {}).get("tool_calls_used", 0) or 0)
     used_gemini = provider.startswith("gemini")
-    # A scenario passes when Davinci produced a result, was driven by Gemini, and
-    # signalled at least one sibling tool creature creature-to-creature.
-    passed = bool(found and result and used_gemini and tool_calls > 0 and c2c_calls > 0)
+    # When a store is configured, discovery must have gone through Path A (the
+    # store) and registered the MCP tools.
+    disc_ok = (discovery == "store" and discovered > 0) if store_cfg else True
+    # A scenario passes when Davinci produced a result, was driven by Gemini,
+    # discovered its tools (via the store when configured), and signalled at
+    # least one sibling tool creature creature-to-creature.
+    passed = bool(found and result and used_gemini and disc_ok
+                  and tool_calls > 0 and c2c_calls > 0)
 
     rec = {"scenario": name, "passed": passed, "vm_id": vm_id,
-           "llm_provider": provider, "gemini_propose_calls": gemini_calls,
+           "llm_provider": provider, "discovery": discovery, "discovered_tools": discovered,
+           "gemini_propose_calls": gemini_calls,
            "tool_calls": tool_calls, "creature_to_creature_calls": c2c_calls,
            "success": result.get("success"),
            "steps_done": result.get("plan", {}).get("progress", {}).get("done")}
@@ -202,16 +278,21 @@ def main() -> int:
         if dt.signal_tool(c, rec):
             summary["tools_signalled"] += 1
 
-    info("── Phase 3: create + deploy the Davinci agent creature ──")
+    info("── Phase 3: deploy stores miniapp, create store, add tools (Path A) ──")
+    store_cfg = setup_store(c, tool_recs)
+    summary["store_id"] = store_cfg.get("store_id", "")
+    summary["discovery"] = "store" if store_cfg else "catalog"
+
+    info("── Phase 4: create + deploy the Davinci agent creature ──")
     davinci = dt.deploy_davinci(c)
     summary["davinci_deployed"] = True
 
-    info("── Phase 4: signal Davinci across diverse scenarios (Gemini-driven) ──")
+    info("── Phase 5: signal Davinci across diverse scenarios (Gemini-driven) ──")
     for scenario in SCENARIOS:
         # Skip scenarios whose categories we deployed none of.
         if not any(cat in {t["category"] for t in tool_recs} for cat in scenario["categories"]):
             continue
-        summary["scenarios"].append(run_scenario(c, davinci, tool_recs, scenario))
+        summary["scenarios"].append(run_scenario(c, davinci, tool_recs, scenario, store_cfg))
         time.sleep(1)
 
     c.close()

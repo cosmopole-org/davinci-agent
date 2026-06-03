@@ -197,8 +197,29 @@ else
   info "--skip-node: assuming a Caspar node is already running on 8074"
 fi
 
+# ─── Build the Decillion stores miniapp (Path A discovery substrate) ──────────
+# Davinci discovers tools by listing a store's MCP machines, so we build+deploy
+# the stores creature. Only the stores creature is built (per request).
+SERVER_DIR="${DECILLIONAI_SERVER_DIR:-$(cd "$CASPAR_DIR/.." && pwd)/decillionai-server}"
+STORES_WASM="${STORES_WASM:-$SERVER_DIR/wasm/stores.wasm}"
+ensure_stores_wasm() {
+  [[ -f "$STORES_WASM" ]] && { ok "stores.wasm present ($STORES_WASM)"; return; }
+  [[ -d "$SERVER_DIR/creatures/stores" ]] || {
+    warn "decillionai-server stores creature not found at $SERVER_DIR — Path A discovery will be skipped"; return; }
+  if ! command -v tinygo >/dev/null 2>&1 && [[ ! -x /usr/local/tinygo/bin/tinygo ]]; then
+    warn "tinygo not installed — cannot build stores.wasm; Path A discovery will be skipped"; return
+  fi
+  info "building stores.wasm (TinyGo)…"
+  ( export PATH="/usr/local/go123/bin:/usr/local/tinygo/bin:$PATH"; export GOROOT="/usr/local/go123"
+    mkdir -p "$SERVER_DIR/wasm"
+    cd "$SERVER_DIR/creatures/stores" && \
+    tinygo build -o "$STORES_WASM" -target=wasi -no-debug -opt=2 -scheduler=none . ) \
+    && ok "built $STORES_WASM" || warn "stores.wasm build failed — Path A discovery will be skipped"
+}
+ensure_stores_wasm
+
 info "── running end-to-end test orchestrator ──"
-export GEMINI_API_KEY GEMINI_MODELS E2E_TOOLS
+export GEMINI_API_KEY GEMINI_MODELS E2E_TOOLS STORES_WASM
 export CASPAR_NODE_HOST_FROM_VM="$NODE_HOST_FROM_VM"
 export CASPAR_CA_BUNDLE="$CA_BUNDLE"
 

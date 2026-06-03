@@ -107,6 +107,32 @@ def _discover_tools() -> list:
     return tools
 
 
+def tool_full_metadata(tool_id: str) -> dict:
+    """The tool's complete point.metadata.json (MCP manifest incl. tools[].args)."""
+    path = TOOLS_DIR / tool_id / "point.metadata.json"
+    try:
+        return json.loads(path.read_text())
+    except OSError:
+        return {}
+
+
+def deploy_wasm_creature(c: CasparSignalingClient, namespace: str, wasm_path: Path,
+                         entity_id: str = "main") -> dict:
+    """Deploy a WASM miniapp creature (e.g. the Decillion ``stores`` namespace).
+
+    Mirrors decillionai-server/bench/deploy.py: create a machine creature, a
+    ``wasm`` program under it, then deploy the .wasm as the program's entity.
+    Returns ``{machine_id, program_id, entity_id}`` — the miniapp signalling
+    target (creatureId = machine_id, programId = program_id).
+    """
+    machine_id = c.create_machine_creature(f"m-{namespace}-{RUN_TAG}")
+    program_id = c.create_program(machine_id, f"/{namespace}", "wasm", f"{namespace} miniapp")
+    c.deploy(program_id, entity_id, "wasm", b64_file(wasm_path),
+             metadata={"namespace": namespace})
+    ok(f"{namespace} miniapp deployed: creature={machine_id} program={program_id}")
+    return {"machine_id": machine_id, "program_id": program_id, "entity_id": entity_id}
+
+
 # Tool creatures to deploy (every tool under tools/ with metadata).
 TOOLS = _discover_tools()
 

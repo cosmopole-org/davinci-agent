@@ -79,8 +79,8 @@ class FakeGateway:
             value = json.loads(payload) if payload else None
             if opcode == OP_HELLO:
                 self.hello = value
-                # The node resolves the container's identity from its token and
-                # reports it back; the container never declares it.
+                # The node resolves the container's identity from its source IP
+                # (here stubbed) and reports it back; the container declares none.
                 self._send(OP_WELCOME, corr, {
                     "ok": True, "sessionId": 7,
                     "vmId": "vm1", "machineId": "m1", "programId": "m1", "creatureId": "c1",
@@ -104,7 +104,7 @@ def gateway():
 
 
 def test_handshake_and_call(gateway):
-    client = CasparBridgeClient("127.0.0.1", gateway.port, token="secret-token", timeout=5)
+    client = CasparBridgeClient("127.0.0.1", gateway.port, timeout=5)
     client.connect()
     assert client.session_id == 7
     # The container adopts the node-assigned identity from WELCOME.
@@ -114,8 +114,8 @@ def test_handshake_and_call(gateway):
         if gateway.hello is not None:
             break
         time.sleep(0.01)
-    # The container authenticated with the token only — no self-declared identity.
-    assert gateway.hello == {"token": "secret-token"}
+    # The container declares no identity and no secret in the handshake.
+    assert gateway.hello == {}
 
     res = client.call("dbOp", {"op": "get", "key": "k"})
     assert res["ok"] is True
@@ -124,7 +124,7 @@ def test_handshake_and_call(gateway):
 
 
 def test_large_payload_chunks(gateway):
-    client = CasparBridgeClient("127.0.0.1", gateway.port, token="t", timeout=10)
+    client = CasparBridgeClient("127.0.0.1", gateway.port, timeout=10)
     client.connect()
     big = "x" * (MAX_CHUNK * 2 + 123)  # forces 3 chunks each way
     res = client.call("httpRequest", {"url": "http://e", "body": big})
@@ -134,7 +134,7 @@ def test_large_payload_chunks(gateway):
 
 def test_signal_delivery(gateway):
     received = []
-    client = CasparBridgeClient("127.0.0.1", gateway.port, token="t", timeout=5)
+    client = CasparBridgeClient("127.0.0.1", gateway.port, timeout=5)
     client.on_signal(lambda key, data: received.append((key, data)))
     client.connect()
     gateway.push_signal("creatures/signal", {"kind": "invoke", "correlationId": "abc"})

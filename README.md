@@ -117,11 +117,12 @@ loads the tool's own `tool.py` and dispatches to its `invoke()`.
 
 A docker creature is sandboxed with **no direct route to the outside world** —
 its only channel is a single TCP connection to the Caspar node's *docker-host
-bridge gateway*. The node injects `CASPAR_GATEWAY_HOST`/`CASPAR_GATEWAY_PORT`
-plus an opaque, node-issued `CASPAR_SESSION_TOKEN` at container start. The
-container authenticates with that token only; the node resolves its
-authoritative identity (`vmId`/`machineId`/`programId`/`creatureId`) from it and
-reports it back in the handshake — a container can never declare or spoof its
+bridge gateway*. The node injects only `CASPAR_GATEWAY_HOST`/`CASPAR_GATEWAY_PORT`
+at container start — no identity and no secret. The node identifies the creature
+from the connection's docker-network **source IP** (it asks docker which
+container owns that IP, then maps the container name to the identity it recorded
+at launch) and reports the resolved identity (`vmId`/`machineId`/`programId`/
+`creatureId`) back in the handshake. A container can never declare or spoof its
 own identity.
 
 `davinci/caspar_bridge.py` (`CasparBridgeClient`, `bridge_from_env()`) speaks the

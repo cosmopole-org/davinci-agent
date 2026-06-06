@@ -71,15 +71,13 @@ class CasparBridgeClient:
         host: str,
         port: int,
         *,
-        token: str = "",
         timeout: float = 60.0,
     ) -> None:
         self.host = host
         self.port = int(port)
-        # The opaque, node-issued session token is the ONLY credential we hold.
-        # The container never declares its own identity; the node resolves it
-        # from the token and reports it back in the WELCOME handshake.
-        self.token = token
+        # The container declares NOTHING about its identity and holds no secret.
+        # The node identifies it from the connection's docker-network source IP
+        # and reports the resolved identity back in the WELCOME handshake.
         self.vm_id = ""
         self.machine_id = ""
         self.program_id = ""
@@ -112,7 +110,8 @@ class CasparBridgeClient:
     def _handshake(self) -> None:
         corr = self._alloc_id()
         ev = self._register(corr)
-        self._send(OP_HELLO, corr, {"token": self.token})
+        # HELLO carries no identity — the node resolves it from our source IP.
+        self._send(OP_HELLO, corr, {})
         if not ev.wait(self.timeout):
             raise BridgeError("handshake timed out waiting for WELCOME")
         res = self._take(corr)
@@ -315,18 +314,16 @@ class CasparBridgeClient:
 def bridge_from_env(*, connect: bool = True, timeout: float = 60.0) -> Optional[CasparBridgeClient]:
     """Build a client from the env the node injects at container start.
 
-    The node provides only the gateway address and an opaque
-    ``CASPAR_SESSION_TOKEN``; the container's identity is resolved server-side
-    from that token. Returns ``None`` when ``CASPAR_GATEWAY_HOST`` is unset
-    (i.e. not running as a gateway-managed docker creature), so callers can fall
-    back gracefully.
+    The node provides only the gateway address; the container's identity is
+    resolved server-side from the connection's docker-network source IP. Returns
+    ``None`` when ``CASPAR_GATEWAY_HOST`` is unset (i.e. not running as a
+    gateway-managed docker creature), so callers can fall back gracefully.
     """
     host = os.environ.get("CASPAR_GATEWAY_HOST", "").strip()
     if not host:
         return None
     port = int(os.environ.get("CASPAR_GATEWAY_PORT", "8079") or "8079")
-    token = os.environ.get("CASPAR_SESSION_TOKEN", "").strip()
-    client = CasparBridgeClient(host, port, token=token, timeout=timeout)
+    client = CasparBridgeClient(host, port, timeout=timeout)
     if connect:
         client.connect()
     return client

@@ -228,6 +228,11 @@ def deploy_tool(c: CasparSignalingClient, tool: dict) -> dict:
     # Build context: the shared runtime + the tool's real implementation, plus
     # its requirements.txt so the tool's own Dockerfile can install its deps.
     files = {"tool_runtime.py": b64_file(REPO / "tools" / "_runtime" / "tool_runtime.py")}
+    # Ship the docker-host bridge client so the tool can reach the node's host
+    # functions (HTTP/DB) and signal its result back over the gateway.
+    bridge_py = REPO / "davinci" / "caspar_bridge.py"
+    if bridge_py.exists():
+        files["caspar_bridge.py"] = b64_file(bridge_py)
     tool_py = tool_dir / "tool.py"
     if tool_py.exists():
         files["tool.py"] = b64_file(tool_py)

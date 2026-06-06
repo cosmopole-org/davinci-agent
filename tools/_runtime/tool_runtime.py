@@ -29,6 +29,69 @@ INPUT_DIR = os.environ.get("DAVINCI_INPUT_DIR", "/app/input")
 TOOL_ID = os.environ.get("TOOL_ID", "")
 
 
+# --------------------------------------------------------------------------- #
+# Docker-host bridge gateway
+#
+# When this tool runs as a gateway-managed docker creature the node injects
+# CASPAR_GATEWAY_* env vars and the bridge client is shipped alongside this
+# runtime (as ``caspar_bridge.py``). The bridge is the tool's only route to the
+# outside world: tool implementations reach the node's HTTP/DB host functions
+# through ``get_bridge()`` and the result is signalled back over the same
+# connection. Everything here is env-guarded so the runtime stays usable (and
+# unit-testable) with no gateway present.
+# --------------------------------------------------------------------------- #
+try:  # shipped into the tool image as a top-level module by the deploy harness
+    import caspar_bridge as _bridge_mod  # type: ignore
+except Exception:  # pragma: no cover - fallback for in-repo execution / tests
+    try:
+        from davinci import caspar_bridge as _bridge_mod  # type: ignore
+    except Exception:
+        _bridge_mod = None  # type: ignore
+
+_BRIDGE = None  # type: ignore
+
+
+def get_bridge():
+    """Return the connected bridge client, or ``None`` when not gateway-managed."""
+    return _BRIDGE
+
+
+def _connect_bridge():
+    global _BRIDGE
+    if _BRIDGE is not None or _bridge_mod is None:
+        return _BRIDGE
+    try:
+        _BRIDGE = _bridge_mod.bridge_from_env()
+    except Exception as exc:  # noqa: BLE001 — never block the tool on bridge setup
+        print(f"TOOL_BRIDGE {json.dumps({'connect_error': repr(exc)[:160]})}", flush=True)
+        _BRIDGE = None
+    return _BRIDGE
+
+
+def _reply_over_bridge(signal: dict, response: dict) -> None:
+    """If the request carried reply metadata, push the result back over the
+    gateway so the caller is notified through the connection (not just logs)."""
+    bridge = _BRIDGE
+    if bridge is None:
+        return
+    payload = signal.get("payload") or {}
+    reply_to = signal.get("reply_to") or payload.get("reply_to") or signal.get("userId")
+    correlation_id = signal.get("correlationId") or payload.get("correlationId")
+    if not reply_to:
+        return
+    # Reply on the "creatures/signal" key so it passes the caller's machine
+    # listener and is pushed onto the caller's gateway connection; the structured
+    # packet lets the caller match it to the originating request.
+    try:
+        bridge.signal_user(
+            "creatures/signal",
+            str(reply_to),
+            {"kind": "tools/result", "correlationId": correlation_id, "result": response},
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"TOOL_BRIDGE {json.dumps({'reply_error': repr(exc)[:160]})}", flush=True)
+
+
 def _read_signal() -> dict:
     path = os.path.join(INPUT_DIR, "task.json")
     if os.path.isfile(path):
@@ -141,6 +204,12 @@ def _dispatch(tool_id: str, function: str, payload: dict) -> dict:
 
 
 def main() -> int:
+    # Open the single gateway connection first; it is the tool's only channel
+    # to the outside world. No-op when not running as a gateway docker creature.
+    bridge = _connect_bridge()
+    if bridge is not None:
+        print(f"TOOL_BRIDGE {json.dumps({'connected': True, 'session': bridge.session_id})}", flush=True)
+
     signal = _read_signal()
     tool_id = signal.get("tool_id") or TOOL_ID or "unknown"
     function = signal.get("function", "invoke")
@@ -152,6 +221,12 @@ def main() -> int:
         result = {"ok": False, "error": traceback.format_exc().splitlines()[-1]}
     response = {"tool_id": tool_id, "function": function, "result": result}
     print("TOOL_RESPONSE " + json.dumps(response, default=str), flush=True)
+    _reply_over_bridge(signal, response)
+    if bridge is not None:
+        try:
+            bridge.close()
+        except Exception:  # noqa: BLE001
+            pass
     return 0
 
 

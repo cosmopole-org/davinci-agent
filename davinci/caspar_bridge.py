@@ -71,18 +71,19 @@ class CasparBridgeClient:
         host: str,
         port: int,
         *,
-        vm_id: str = "",
-        machine_id: str = "",
-        program_id: str = "",
-        creature_id: str = "",
+        token: str = "",
         timeout: float = 60.0,
     ) -> None:
         self.host = host
         self.port = int(port)
-        self.vm_id = vm_id
-        self.machine_id = machine_id
-        self.program_id = program_id
-        self.creature_id = creature_id
+        # The opaque, node-issued session token is the ONLY credential we hold.
+        # The container never declares its own identity; the node resolves it
+        # from the token and reports it back in the WELCOME handshake.
+        self.token = token
+        self.vm_id = ""
+        self.machine_id = ""
+        self.program_id = ""
+        self.creature_id = ""
         self.timeout = timeout
 
         self._sock: Optional[socket.socket] = None
@@ -109,21 +110,20 @@ class CasparBridgeClient:
         return self
 
     def _handshake(self) -> None:
-        hello = {
-            "vmId": self.vm_id,
-            "machineId": self.machine_id,
-            "programId": self.program_id,
-            "creatureId": self.creature_id,
-        }
         corr = self._alloc_id()
         ev = self._register(corr)
-        self._send(OP_HELLO, corr, hello)
+        self._send(OP_HELLO, corr, {"token": self.token})
         if not ev.wait(self.timeout):
             raise BridgeError("handshake timed out waiting for WELCOME")
         res = self._take(corr)
         if not isinstance(res, dict) or not res.get("ok", False):
             raise BridgeError(f"handshake rejected: {res}")
         self.session_id = res.get("sessionId")
+        # Adopt the node-assigned (authoritative) identity reported back to us.
+        self.vm_id = res.get("vmId", "")
+        self.machine_id = res.get("machineId", "")
+        self.program_id = res.get("programId", "")
+        self.creature_id = res.get("creatureId", "")
 
     def close(self) -> None:
         self._closed.set()
@@ -315,22 +315,18 @@ class CasparBridgeClient:
 def bridge_from_env(*, connect: bool = True, timeout: float = 60.0) -> Optional[CasparBridgeClient]:
     """Build a client from the env the node injects at container start.
 
-    Returns ``None`` when ``CASPAR_GATEWAY_HOST`` is unset (i.e. not running as a
-    gateway-managed docker creature), so callers can fall back gracefully.
+    The node provides only the gateway address and an opaque
+    ``CASPAR_SESSION_TOKEN``; the container's identity is resolved server-side
+    from that token. Returns ``None`` when ``CASPAR_GATEWAY_HOST`` is unset
+    (i.e. not running as a gateway-managed docker creature), so callers can fall
+    back gracefully.
     """
     host = os.environ.get("CASPAR_GATEWAY_HOST", "").strip()
     if not host:
         return None
     port = int(os.environ.get("CASPAR_GATEWAY_PORT", "8079") or "8079")
-    client = CasparBridgeClient(
-        host,
-        port,
-        vm_id=os.environ.get("CASPAR_VM_ID", ""),
-        machine_id=os.environ.get("CASPAR_MACHINE_ID", ""),
-        program_id=os.environ.get("CASPAR_PROGRAM_ID", ""),
-        creature_id=os.environ.get("CASPAR_CREATURE_ID", ""),
-        timeout=timeout,
-    )
+    token = os.environ.get("CASPAR_SESSION_TOKEN", "").strip()
+    client = CasparBridgeClient(host, port, token=token, timeout=timeout)
     if connect:
         client.connect()
     return client

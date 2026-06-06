@@ -354,7 +354,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         bridge = None
 
     if bridge is not None:
-        my_id = os.environ.get("CASPAR_MACHINE_ID") or os.environ.get("CASPAR_PROGRAM_ID") or ""
+        # Use the node-assigned identity reported in the WELCOME handshake — the
+        # container never declares its own id.
+        my_id = bridge.machine_id or bridge.program_id or ""
         tools_by_name = {t.get("name") or f"caspar__{t['tool_id']}": t for t in tools}
         registry = _registry_from_tool_catalog(tools) if tools else _build_registry()
         executor = BridgeCreatureExecutor(bridge, tools_by_name, my_id)

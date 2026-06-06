@@ -118,8 +118,11 @@ loads the tool's own `tool.py` and dispatches to its `invoke()`.
 A docker creature is sandboxed with **no direct route to the outside world** —
 its only channel is a single TCP connection to the Caspar node's *docker-host
 bridge gateway*. The node injects `CASPAR_GATEWAY_HOST`/`CASPAR_GATEWAY_PORT`
-plus the creature's identity (`CASPAR_VM_ID`/`CASPAR_MACHINE_ID`/
-`CASPAR_PROGRAM_ID`/`CASPAR_CREATURE_ID`) at container start.
+plus an opaque, node-issued `CASPAR_SESSION_TOKEN` at container start. The
+container authenticates with that token only; the node resolves its
+authoritative identity (`vmId`/`machineId`/`programId`/`creatureId`) from it and
+reports it back in the handshake — a container can never declare or spoof its
+own identity.
 
 `davinci/caspar_bridge.py` (`CasparBridgeClient`, `bridge_from_env()`) speaks the
 gateway's chunked wire protocol. Over that one connection a creature:

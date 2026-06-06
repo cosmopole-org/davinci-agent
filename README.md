@@ -113,6 +113,28 @@ A tool creature reads its signal from `/app/input/task.json`
 stdout (captured as VM logs). The shared runtime (`tools/_runtime/tool_runtime.py`)
 loads the tool's own `tool.py` and dispatches to its `invoke()`.
 
+### Docker-host bridge gateway (egress/ingress)
+
+A docker creature is sandboxed with **no direct route to the outside world** —
+its only channel is a single TCP connection to the Caspar node's *docker-host
+bridge gateway*. The node injects `CASPAR_GATEWAY_HOST`/`CASPAR_GATEWAY_PORT`
+plus the creature's identity (`CASPAR_VM_ID`/`CASPAR_MACHINE_ID`/
+`CASPAR_PROGRAM_ID`/`CASPAR_CREATURE_ID`) at container start.
+
+`davinci/caspar_bridge.py` (`CasparBridgeClient`, `bridge_from_env()`) speaks the
+gateway's chunked wire protocol. Over that one connection a creature:
+
+- runs any node host function — DB/storage ops, **outbound HTTP**, signalling —
+  via `bridge.call(op, input)` (the node stamps the verified identity), and
+- receives pushed signals from other creatures via `bridge.on_signal(handler)`.
+
+When the gateway env is present the Davinci creature drives sibling tool
+creatures over the bridge (`BridgeCreatureExecutor`): it signals a tool's
+machine and awaits the tool's correlated reply — both pushed over their
+respective gateway connections. The client is shipped into every tool image by
+the deploy harness; the tool runtime auto-connects and replies over it. See
+`caspar/docs/DOCKER_HOST_GATEWAY.md` for the protocol spec.
+
 ### Tools (real implementations)
 
 Every tool is a full implementation, not a stub. Each ships its own

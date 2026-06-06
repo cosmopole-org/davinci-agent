@@ -85,6 +85,77 @@ class CasparCreatureExecutor:
         return ToolResult(ok=True, output={"tool": tool.name, "vm_id": vm_id, "response": response})
 
 
+class BridgeCreatureExecutor:
+    """Live executor that drives sibling tool creatures purely over the
+    docker-host bridge gateway — Davinci's only channel to the outside world.
+
+    To invoke a tool, Davinci pushes a ``creatures/signal`` to the tool's machine
+    (via the node ``signalUser`` host function); the node delivers it to the
+    tool's container over *its* gateway connection. The tool runs and signals its
+    result back on the same key, which the node pushes onto Davinci's connection.
+    Requests and replies are paired by ``correlationId``.
+    """
+
+    def __init__(self, bridge: Any, tools_by_name: Dict[str, Dict[str, Any]], my_id: str) -> None:
+        import threading
+        self.bridge = bridge
+        self.tools = tools_by_name
+        self.my_id = my_id
+        self._lock = threading.Lock()
+        self._waiters: Dict[str, threading.Event] = {}
+        self._results: Dict[str, Any] = {}
+        bridge.on_signal(self.handle_signal)
+
+    def handle_signal(self, key: str, data: Any) -> None:
+        if key != "creatures/signal" or not isinstance(data, dict):
+            return
+        if data.get("kind") != "tools/result":
+            return
+        cid = str(data.get("correlationId") or "")
+        with self._lock:
+            ev = self._waiters.get(cid)
+            if ev is not None:
+                self._results[cid] = data.get("result")
+                ev.set()
+
+    def execute(self, tool: ToolDescriptor, action: ToolAction) -> ToolResult:
+        import threading
+        import uuid
+        spec = self.tools.get(tool.name)
+        if not spec:
+            return ToolResult(ok=False, output=None, error=f"unknown tool creature {tool.name}")
+        target = spec.get("program_id") or spec.get("machine_id") or ""
+        if not target:
+            return ToolResult(ok=False, output=None, error=f"no target machine for tool {tool.name}")
+        payload = {k: v for k, v in (action.args or {}).items() if v is not None}
+        correlation_id = uuid.uuid4().hex
+        packet = {
+            "kind": "invoke",
+            "correlationId": correlation_id,
+            "reply_to": self.my_id,
+            "tool_id": spec.get("tool_id", tool.name),
+            "function": spec.get("function", "invoke"),
+            "payload": payload,
+        }
+        ev = threading.Event()
+        with self._lock:
+            self._waiters[correlation_id] = ev
+        try:
+            ack = self.bridge.signal_user("creatures/signal", str(target), packet)
+        except Exception as exc:  # noqa: BLE001
+            return ToolResult(ok=False, output=None, error=f"bridge signal failed: {exc}")
+        if isinstance(ack, dict) and ack.get("ok") is False:
+            return ToolResult(ok=False, output={"ack": ack}, error="node rejected tool signal")
+        timeout = float(spec.get("max_exec_seconds", 75))
+        delivered = ev.wait(timeout)
+        with self._lock:
+            self._waiters.pop(correlation_id, None)
+            result = self._results.pop(correlation_id, None)
+        if not delivered:
+            return ToolResult(ok=False, output=None, error="tool creature result timed out")
+        return ToolResult(ok=True, output={"tool": tool.name, "response": result})
+
+
 def _read_task() -> Dict[str, Any]:
     """Resolve the task from /app/input files or environment."""
     # 1) explicit env task
@@ -270,7 +341,32 @@ def main(argv: Optional[List[str]] = None) -> int:
     executor: Any = EchoExecutor()
     discovery = "none"
     mode_default = "auto"
-    if live:
+
+    # Gateway path: when the node injected CASPAR_GATEWAY_* env, this container
+    # is a gateway-managed docker creature and the bridge is its *only* route to
+    # the outside world. Use it for tool execution and skip the external client.
+    bridge = None
+    try:
+        from .caspar_bridge import bridge_from_env
+        bridge = bridge_from_env()
+    except Exception as exc:  # noqa: BLE001 — fall back to legacy/offline paths
+        print("DAVINCI_BOOT " + json.dumps({"bridge_init_error": repr(exc)[:160]}), flush=True)
+        bridge = None
+
+    if bridge is not None:
+        my_id = os.environ.get("CASPAR_MACHINE_ID") or os.environ.get("CASPAR_PROGRAM_ID") or ""
+        tools_by_name = {t.get("name") or f"caspar__{t['tool_id']}": t for t in tools}
+        registry = _registry_from_tool_catalog(tools) if tools else _build_registry()
+        executor = BridgeCreatureExecutor(bridge, tools_by_name, my_id)
+        discovery = "bridge"
+        live = True
+        if not required:
+            required = list(dict.fromkeys(
+                t.get("category", "general") for t in tools_by_name.values()))[:4]
+        print("DAVINCI_BRIDGE " + json.dumps({
+            "connected": True, "session": bridge.session_id, "vm_id": os.environ.get("CASPAR_VM_ID", ""),
+            "tools": list(tools_by_name.keys())}), flush=True)
+    elif live:
         try:
             from .caspar_signaling import CasparSignalingClient
             client = CasparSignalingClient(node_host, int(config.get("node_port", 8074)))

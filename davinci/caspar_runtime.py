@@ -41,6 +41,74 @@ from .permissions import PermissionEngine, PermissionMode, Risk, ToolAction
 INPUT_DIR = os.environ.get("DAVINCI_INPUT_DIR", "/app/input")
 
 
+# --------------------------------------------------------------------------- #
+# Session sandbox lifecycle
+#
+# When a `sandbox_pc` tool creature is part of the configured catalog, the per-
+# session Firecracker VM must be kept ALIVE while davinci is actively servicing
+# this session (planning, calling tools, talking to the LLM, answering the
+# user) and SUSPENDED (turned off, disk kept) once the response is delivered so
+# the next prompt can wake it on the same persistent disk.
+#
+# We intentionally do this at the runtime boundary (around agent.run) rather
+# than inside the engine: the engine is portable across executors, but the
+# fire-VM lifetime is a property of the deployed Caspar runtime.
+# --------------------------------------------------------------------------- #
+
+
+def _find_sandbox_tool_spec(tools_by_name: Dict[str, Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    for spec in tools_by_name.values():
+        if spec.get("tool_id") == "sandbox_pc":
+            return spec
+    return None
+
+
+class _SessionSandbox:
+    """Keep the session's fire VM warm for the duration of one agent run.
+
+    On entry: signal `start` so the VM is up on its persistent disk before the
+    first reasoner step. On exit: signal `suspend` (idle / keep disk). All
+    failures are swallowed — a sandbox that cannot be reached must never block
+    the agent loop from running with the rest of its tools.
+    """
+
+    def __init__(self, bridge: Any, spec: Optional[Dict[str, Any]], session_id: str) -> None:
+        self.bridge = bridge
+        self.spec = spec
+        self.session_id = session_id
+        self.target = (spec or {}).get("program_id") or (spec or {}).get("machine_id") or "sandbox"
+
+    def _signal(self, action: str) -> None:
+        if self.bridge is None or self.spec is None:
+            return
+        try:
+            self.bridge.signal_user(
+                "creatures/signal",
+                str(self.target),
+                {
+                    "kind": "invoke",
+                    "tool_id": "sandbox_pc",
+                    "function": action,
+                    "action": action,
+                    "payload": {"sessionId": self.session_id},
+                },
+            )
+            print("DAVINCI_SANDBOX " + json.dumps({"action": action, "session": self.session_id}),
+                  flush=True)
+        except Exception as exc:  # noqa: BLE001
+            print("DAVINCI_SANDBOX " + json.dumps({"error": repr(exc)[:160], "action": action}),
+                  flush=True)
+
+    def __enter__(self) -> "_SessionSandbox":
+        self._signal("start")
+        return self
+
+    def __exit__(self, *_exc: Any) -> None:
+        # Idle path: turn off but KEEP the persistent disk. The next prompt for
+        # this session will wake it transparently via the host's wake-on-exec.
+        self._signal("suspend")
+
+
 class BridgeCreatureExecutor:
     """Live executor that drives sibling tool creatures purely over the
     docker-host bridge gateway — Davinci's only channel to the outside world.
@@ -235,6 +303,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     discovery = "none"
     mode_default = "auto"
     live = False
+    tools_by_name: Dict[str, Dict[str, Any]] = {}
 
     # Gateway path: when the node injected CASPAR_GATEWAY_* env, this container
     # is a gateway-managed docker creature and the bridge is its *only* route to
@@ -301,7 +370,16 @@ def main(argv: Optional[List[str]] = None) -> int:
         budget=Budget(max_steps=int(os.environ.get("DAVINCI_MAX_STEPS", "20"))),
     )
 
-    result = agent.run(objective, required_categories=required)
+    # Per-session sandbox VM lifecycle: warm before the loop, suspend after.
+    # No-op when no sandbox_pc tool is configured or no bridge is available.
+    sandbox_spec = _find_sandbox_tool_spec(tools_by_name) if bridge is not None else None
+    session_id = (
+        task.get("session_id")
+        or task.get("sessionId")
+        or (f"davinci-{bridge.session_id}" if bridge and getattr(bridge, "session_id", None) else "davinci-default")
+    )
+    with _SessionSandbox(bridge, sandbox_spec, session_id):
+        result = agent.run(objective, required_categories=required)
     print("DAVINCI_RESULT " + json.dumps(result.to_dict()), flush=True)
     return 0 if result.success else 2
 

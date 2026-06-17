@@ -1,0 +1,70 @@
+{
+  "isMcp": true,
+  "tool_id": "sandbox_pc",
+  "vm_name": "sandbox-vm",
+  "machine_id": "sandbox-machine",
+  "image_name": "sandbox-tools:latest",
+  "container_name": "tool-sandbox-pc",
+  "description": "Per-session Firecracker/docker sandbox VM with persistent disk",
+  "prompt": "Use to run shell commands inside a private, per-session sandbox VM (Firecracker microVM or docker container) that persists installed software and data between turns. The VM is automatically woken on the next command and suspended when the session goes idle.",
+  "request_point": "tool::sandbox_pc::request",
+  "response_point": "tool::sandbox_pc::response",
+  "risk_level": "high",
+  "requires_network": false,
+  "categories": [
+    "execution"
+  ],
+  "routes": {
+    "execution": "exec"
+  },
+  "tools": [
+    {
+      "name": "exec",
+      "desc": "run a shell command inside the session's persistent fire VM; auto-wakes the VM if it was suspended",
+      "args": {
+        "command": {"type": "STRING", "desc": "shell command to execute"},
+        "session_id": {"type": "STRING", "desc": "optional davinci session id (one VM per session)"},
+        "runtime": {"type": "STRING", "desc": "sandbox VM runtime: 'fire' (Firecracker, default) or 'docker'"},
+        "timeout_seconds": {"type": "NUMBER", "desc": "optional per-command timeout (default 60)"}
+      }
+    },
+    {
+      "name": "start",
+      "desc": "explicitly boot or resume the session's fire VM on its persistent disk",
+      "args": {
+        "session_id": {"type": "STRING", "desc": "optional davinci session id"}
+      }
+    },
+    {
+      "name": "write",
+      "desc": "drop a file into the session's fire VM at a chosen path",
+      "args": {
+        "file_name": {"type": "STRING", "desc": "file name"},
+        "target_path": {"type": "STRING", "desc": "absolute directory inside the VM (default /tmp)"},
+        "content": {"type": "STRING", "desc": "file content"},
+        "session_id": {"type": "STRING", "desc": "optional davinci session id"}
+      }
+    },
+    {
+      "name": "suspend",
+      "desc": "turn the session's fire VM off but KEEP its persistent disk — software and data survive",
+      "args": {
+        "session_id": {"type": "STRING", "desc": "optional davinci session id"}
+      }
+    },
+    {
+      "name": "delete",
+      "desc": "turn the session's fire VM off AND purge its persistent disk — destroys the sandbox",
+      "args": {
+        "session_id": {"type": "STRING", "desc": "optional davinci session id"}
+      }
+    },
+    {
+      "name": "status",
+      "desc": "report the session's fire VM last-known state",
+      "args": {
+        "session_id": {"type": "STRING", "desc": "optional davinci session id"}
+      }
+    }
+  ]
+}

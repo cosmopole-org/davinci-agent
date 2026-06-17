@@ -1,20 +1,16 @@
-"""Tests for the sandbox_pc tool + session-sandbox lifecycle wiring.
+"""Tests for the sandbox_pc tool + SandboxManager + session lifecycle.
 
-These tests cover:
-1. The tool.py invoke surface (input validation + envelope shape sent to the
-   sandbox creature over the bridge).
-2. The correlation-id-matched reply flow (a stub bridge plays the role of the
-   sandbox creature and signals a result back; the tool returns it).
-3. The runtime's `_SessionSandbox` context manager: it must signal `start` on
-   entry and `suspend` on exit when a sandbox_pc tool is configured, and be a
-   silent no-op when one isn't.
+The sandbox_pc tool now manages per-session VMs *directly* through the vmm host
+functions over the bridge (runVm / execVm / terminateVm / copyToVm) — there is
+no intermediary creature. These tests drive the real tool.py and the real
+davinci.sandbox_core.SandboxManager against a fake bridge that records the host
+calls and returns host-shaped results.
 """
 
 from __future__ import annotations
 
 import importlib.util
 import sys
-import threading
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
@@ -23,45 +19,42 @@ _REPO = Path(__file__).resolve().parents[1]
 _TOOL_PATH = _REPO / "tools" / "sandbox_pc" / "tool.py"
 
 
+class _FakeBridge:
+    """Records bridge.call(op, input) and returns canned host results."""
+
+    def __init__(self, *, session_id: int = 7, machine_id: str = "m-davinci",
+                 responses: Optional[Dict[str, Any]] = None) -> None:
+        self.session_id = session_id
+        self.machine_id = machine_id
+        self.calls: List[Dict[str, Any]] = []
+        self.responses = responses or {}
+
+    def call(self, op: str, input: Dict[str, Any]) -> Dict[str, Any]:
+        self.calls.append({"op": op, "input": input})
+        r = self.responses.get(op)
+        if callable(r):
+            return r(input)
+        if r is not None:
+            return r
+        return {"ok": True, "runtime": input.get("runtime"), "vmId": input.get("vmId")}
+
+    def ops(self) -> List[str]:
+        return [c["op"] for c in self.calls if c["op"] not in ("putJson", "getJson")]
+
+    def first(self, op: str) -> Dict[str, Any]:
+        return next(c["input"] for c in self.calls if c["op"] == op)
+
+
 def _load_tool_module(bridge_factory: Callable[[], Any]):
-    """Load tools/sandbox_pc/tool.py with a stub tool_runtime.get_bridge()."""
-    # Stub tool_runtime so the tool module's _get_bridge() returns our fake.
     stub = type(sys)("tool_runtime")
     stub.get_bridge = bridge_factory  # type: ignore[attr-defined]
     sys.modules["tool_runtime"] = stub
     spec = importlib.util.spec_from_file_location(
-        "sandbox_pc_tool_" + str(id(bridge_factory)), _TOOL_PATH
-    )
+        "sandbox_pc_tool_" + str(id(bridge_factory)), _TOOL_PATH)
     assert spec is not None and spec.loader is not None
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
-
-
-class _FakeBridge:
-    """Records signal_user calls and lets the test replay an `on_signal` reply."""
-
-    def __init__(self, *, machine_id: str = "davinci-machine", session_id: int = 7,
-                 reply_with: Optional[Dict[str, Any]] = None) -> None:
-        self.machine_id = machine_id
-        self.creature_id = ""
-        self.session_id = session_id
-        self.sent: List[Dict[str, Any]] = []
-        self._reply_with = reply_with
-        self._handler: Optional[Callable[[Any], None]] = None
-
-    def on_signal(self, handler: Callable[[Any], None]) -> None:
-        self._handler = handler
-
-    def signal_user(self, key: str, user_id: str, packet: Any) -> Dict[str, Any]:
-        self.sent.append({"key": key, "user_id": user_id, "packet": packet})
-        if self._reply_with is not None and self._handler is not None:
-            # Replay the sandbox creature's signalUser("creatures/signal/result")
-            # response on a background thread so the waiter sees ev.set().
-            reply = dict(self._reply_with)
-            reply["correlationId"] = packet["correlationId"]
-            threading.Thread(target=self._handler, args=(reply,), daemon=True).start()
-        return {"ok": True}
 
 
 # --------------------------------------------------------------------------- #
@@ -69,133 +62,138 @@ class _FakeBridge:
 # --------------------------------------------------------------------------- #
 
 def test_invoke_requires_command_for_exec():
-    mod = _load_tool_module(lambda: None)
-    out = mod.invoke("exec", {})
-    assert out["ok"] is False
-    assert "command" in out["error"]
+    out = _load_tool_module(lambda: _FakeBridge()).invoke("exec", {})
+    assert out["ok"] is False and "command" in out["error"]
 
 
-def test_invoke_requires_content_for_write():
-    mod = _load_tool_module(lambda: None)
-    out = mod.invoke("write", {"file_name": "a.txt", "target_path": "/tmp"})
-    assert out["ok"] is False
-    assert "content" in out["error"]
+def test_invoke_requires_file_name_for_write():
+    out = _load_tool_module(lambda: _FakeBridge()).invoke("write", {"content": "x"})
+    assert out["ok"] is False and "file_name" in out["error"]
 
 
-def test_invoke_reports_no_bridge_for_status():
-    mod = _load_tool_module(lambda: None)
-    out = mod.invoke("status", {})
-    assert out["ok"] is False
-    assert "bridge" in out["error"]
+def test_no_bridge_reports_error():
+    out = _load_tool_module(lambda: None).invoke("start", {"session_id": "s1"})
+    assert out["ok"] is False and "bridge" in out["error"]
 
 
 # --------------------------------------------------------------------------- #
-# End-to-end signaling with a stub bridge playing the sandbox creature
+# exec / start / write / suspend / delete -> correct host ops
 # --------------------------------------------------------------------------- #
 
-def test_exec_signals_sandbox_and_returns_correlated_result():
-    bridge = _FakeBridge(reply_with={"ok": True, "output": "hello\n", "vmId": "sess-davinci-7"})
+def test_exec_calls_execVm_with_session_vm_id_and_output():
+    bridge = _FakeBridge(responses={"execVm": lambda i: {"ok": True, "output": "hello\n",
+                                                          "vmId": i["vmId"], "runtime": i["runtime"]}})
     mod = _load_tool_module(lambda: bridge)
-
-    out = mod.invoke("exec", {"command": "echo hello"})
+    out = mod.invoke("exec", {"command": "echo hello", "runtime": "fire"})
 
     assert out["ok"] is True
     assert out["output"] == "hello\n"
     assert out["action"] == "exec"
-    assert out["session_id"] == "davinci-7"  # derived from bridge.session_id
-
-    # The signal goes on `creatures/signal` to the default sandbox target,
-    # and the envelope carries the action, payload, correlation id, and reply_to.
-    assert len(bridge.sent) == 1
-    pkt = bridge.sent[0]
-    assert pkt["key"] == "creatures/signal"
-    assert pkt["user_id"] == "sandbox"
-    env = pkt["packet"]
-    assert env["function"] == "exec"
-    assert env["action"] == "exec"
-    assert env["payload"]["command"] == "echo hello"
-    assert env["payload"]["sessionId"] == "davinci-7"
-    assert env["reply_to"] == "davinci-machine"
-    assert isinstance(env["correlationId"], str) and len(env["correlationId"]) > 0
+    assert out["vmId"] == "sess-davinci-7"          # derived from bridge.session_id
+    assert "execVm" in bridge.ops()
+    ev = bridge.first("execVm")
+    assert ev["command"] == "echo hello"
+    assert ev["machineId"] == "sandbox"             # fixed namespace, not the caller id
+    assert ev["vmId"] == "sess-davinci-7"
+    assert ev["persistent"] is True
+    assert ev["runtime"] == "fire"
 
 
-def test_suspend_uses_short_timeout_and_resolves_session_id_from_payload():
-    bridge = _FakeBridge(reply_with={"ok": True, "status": "suspended"})
-    mod = _load_tool_module(lambda: bridge)
+def test_exec_runtime_docker_routes_to_docker():
+    bridge = _FakeBridge()
+    out = _load_tool_module(lambda: bridge).invoke(
+        "exec", {"command": "id", "session_id": "abc", "runtime": "docker"})
+    ev = bridge.first("execVm")
+    assert out["vmId"] == "sess-abc"
+    assert ev["runtime"] == "docker"
+    assert ev["imageRef"]                           # docker boot needs an image
 
-    out = mod.invoke("suspend", {"session_id": "abc-123"})
-    assert out["ok"] is True
+
+def test_start_docker_includes_keepalive_command_and_image():
+    bridge = _FakeBridge()
+    _load_tool_module(lambda: bridge).invoke("start", {"session_id": "s1", "runtime": "docker"})
+    rv = bridge.first("runVm")
+    assert rv["vmId"] == "sess-s1"
+    assert rv["runtime"] == "docker"
+    assert "tail -f /dev/null" in rv["command"]     # keep-alive entrypoint
+    assert rv["imageRef"]
+
+
+def test_suspend_calls_terminateVm_purge_false():
+    bridge = _FakeBridge()
+    out = _load_tool_module(lambda: bridge).invoke("suspend", {"session_id": "s1"})
+    tv = bridge.first("terminateVm")
+    assert tv["purge"] is False
     assert out["action"] == "suspend"
-    assert bridge.sent[0]["packet"]["payload"]["sessionId"] == "abc-123"
-    # Session id appears in the result for caller-side correlation.
-    assert out["session_id"] == "abc-123"
+
+
+def test_delete_calls_terminateVm_purge_true():
+    bridge = _FakeBridge()
+    out = _load_tool_module(lambda: bridge).invoke("delete", {"session_id": "s1"})
+    tv = bridge.first("terminateVm")
+    assert tv["purge"] is True
+    assert out["action"] == "delete"
+
+
+def test_write_calls_copyToVm():
+    bridge = _FakeBridge()
+    out = _load_tool_module(lambda: bridge).invoke(
+        "write", {"session_id": "s1", "file_name": "a.txt", "content": "hi"})
+    cp = bridge.first("copyToVm")
+    assert cp["fileName"] == "a.txt" and cp["content"] == "hi"
+    assert out["action"] == "write"
 
 
 # --------------------------------------------------------------------------- #
-# Runtime lifecycle: _SessionSandbox + _find_sandbox_tool_spec
+# SandboxManager unit behaviour
 # --------------------------------------------------------------------------- #
 
-def test_find_sandbox_tool_spec_locates_by_tool_id():
+def test_manager_session_vm_id_and_resolution():
+    from davinci.sandbox_core import SandboxManager, session_vm_id
+    assert session_vm_id("davinci-9") == "sess-davinci-9"
+    assert session_vm_id("") == "main"
+    mgr = SandboxManager(_FakeBridge(session_id=42))
+    assert mgr.resolve_session({}) == "davinci-42"
+    assert mgr.resolve_session({"session_id": "X"}) == "X"
+
+
+def test_manager_propagates_host_failure():
+    from davinci.sandbox_core import SandboxManager
+    bridge = _FakeBridge(responses={"runVm": {"ok": False, "error": "boom"}})
+    out = SandboxManager(bridge, default_runtime="fire").start("s1")
+    assert out["ok"] is False and out["error"] == "boom"
+
+
+# --------------------------------------------------------------------------- #
+# Runtime session lifecycle (_SessionSandbox + _sandbox_enabled)
+# --------------------------------------------------------------------------- #
+
+def test_sandbox_enabled_detects_tool():
     from davinci import caspar_runtime as rt
-    spec = rt._find_sandbox_tool_spec({
-        "caspar__web_search": {"tool_id": "web_search"},
-        "caspar__sandbox_pc": {"tool_id": "sandbox_pc", "machine_id": "m1"},
-    })
-    assert spec is not None
-    assert spec["tool_id"] == "sandbox_pc"
-    assert spec["machine_id"] == "m1"
+    assert rt._sandbox_enabled({"caspar__sandbox_pc": {"tool_id": "sandbox_pc"}}) is True
+    assert rt._sandbox_enabled({"caspar__web_search": {"tool_id": "web_search"}}) is False
 
 
-def test_find_sandbox_tool_spec_returns_none_when_absent():
-    from davinci import caspar_runtime as rt
-    assert rt._find_sandbox_tool_spec({"caspar__web_search": {"tool_id": "web_search"}}) is None
-
-
-def test_session_sandbox_signals_start_and_suspend():
-    from davinci import caspar_runtime as rt
-
-    bridge = _FakeBridge()
-    spec = {"tool_id": "sandbox_pc", "machine_id": "sandbox-machine-xyz"}
-    with rt._SessionSandbox(bridge, spec, session_id="sid-1"):
-        # Inside the loop: VM is being kept warm — start was signalled.
-        assert len(bridge.sent) == 1
-        first = bridge.sent[0]
-        assert first["user_id"] == "sandbox-machine-xyz"
-        assert first["packet"]["function"] == "start"
-        assert first["packet"]["payload"]["sessionId"] == "sid-1"
-
-    # On exit: VM is suspended (disk kept).
-    assert len(bridge.sent) == 2
-    second = bridge.sent[1]
-    assert second["packet"]["function"] == "suspend"
-    assert second["packet"]["payload"]["sessionId"] == "sid-1"
-
-
-def test_session_sandbox_is_noop_without_spec():
+def test_session_sandbox_starts_and_suspends_via_host_ops():
     from davinci import caspar_runtime as rt
     bridge = _FakeBridge()
-    with rt._SessionSandbox(bridge, None, session_id="x"):
-        pass
-    assert bridge.sent == []
+    with rt._SessionSandbox(bridge, True, "sid-1"):
+        assert bridge.ops() == ["runVm"]            # started on entry
+        assert bridge.first("runVm")["vmId"] == "sess-sid-1"
+    assert bridge.ops() == ["runVm", "terminateVm"]  # suspended on exit
+    tv = bridge.first("terminateVm")
+    assert tv["purge"] is False
 
 
-def test_exec_passes_runtime_to_sandbox_creature():
-    bridge = _FakeBridge(reply_with={"ok": True, "output": "container-OK\n", "runtime": "docker"})
-    mod = _load_tool_module(lambda: bridge)
-
-    out = mod.invoke("exec", {"command": "echo container-OK", "runtime": "docker"})
-
-    assert out["ok"] is True
-    pkt = bridge.sent[0]["packet"]
-    # The runtime field flows through the envelope to the sandbox creature so
-    # the host routes to the docker controller instead of the fire one.
-    assert pkt["payload"]["runtime"] == "docker"
-    assert pkt["payload"]["command"] == "echo container-OK"
-
-
-def test_session_sandbox_is_noop_without_bridge():
+def test_session_sandbox_noop_when_disabled():
     from davinci import caspar_runtime as rt
-    spec = {"tool_id": "sandbox_pc", "machine_id": "m"}
-    # Must not raise; just a silent no-op.
-    with rt._SessionSandbox(None, spec, session_id="x"):
+    bridge = _FakeBridge()
+    with rt._SessionSandbox(bridge, False, "x"):
         pass
+    assert bridge.calls == []
+
+
+def test_session_sandbox_noop_without_bridge():
+    from davinci import caspar_runtime as rt
+    with rt._SessionSandbox(None, True, "x"):
+        pass  # must not raise

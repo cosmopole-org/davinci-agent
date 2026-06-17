@@ -44,69 +44,66 @@ INPUT_DIR = os.environ.get("DAVINCI_INPUT_DIR", "/app/input")
 # --------------------------------------------------------------------------- #
 # Session sandbox lifecycle
 #
-# When a `sandbox_pc` tool creature is part of the configured catalog, the per-
-# session Firecracker VM must be kept ALIVE while davinci is actively servicing
-# this session (planning, calling tools, talking to the LLM, answering the
-# user) and SUSPENDED (turned off, disk kept) once the response is delivered so
-# the next prompt can wake it on the same persistent disk.
+# When a `sandbox_pc` tool is part of the configured catalog, the per-session
+# sandbox VM must be kept ALIVE while davinci is actively servicing this session
+# (planning, calling tools, talking to the LLM, answering the user) and
+# SUSPENDED (turned off, disk kept) once the response is delivered so the next
+# prompt can wake it on the same persistent disk.
 #
-# We intentionally do this at the runtime boundary (around agent.run) rather
-# than inside the engine: the engine is portable across executors, but the
-# fire-VM lifetime is a property of the deployed Caspar runtime.
+# The VM is driven through the SAME shared SandboxManager the tool uses, over
+# this runtime's own bridge — no intermediary creature. We do this at the
+# runtime boundary (around agent.run) rather than inside the engine: the engine
+# is portable across executors, but a session VM's lifetime is a property of the
+# deployed Caspar runtime.
 # --------------------------------------------------------------------------- #
 
 
-def _find_sandbox_tool_spec(tools_by_name: Dict[str, Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    for spec in tools_by_name.values():
-        if spec.get("tool_id") == "sandbox_pc":
-            return spec
-    return None
+def _sandbox_enabled(tools_by_name: Dict[str, Dict[str, Any]]) -> bool:
+    """True when a `sandbox_pc` tool is part of the configured catalog."""
+    return any(spec.get("tool_id") == "sandbox_pc" for spec in tools_by_name.values())
 
 
 class _SessionSandbox:
-    """Keep the session's fire VM warm for the duration of one agent run.
+    """Keep the session's sandbox VM warm for the duration of one agent run.
 
-    On entry: signal `start` so the VM is up on its persistent disk before the
-    first reasoner step. On exit: signal `suspend` (idle / keep disk). All
-    failures are swallowed — a sandbox that cannot be reached must never block
-    the agent loop from running with the rest of its tools.
+    On entry: `start` the VM on its persistent disk before the first reasoner
+    step. On exit: `suspend` it (idle / keep disk). All failures are swallowed —
+    a sandbox that cannot be reached must never block the agent loop from
+    running with the rest of its tools.
     """
 
-    def __init__(self, bridge: Any, spec: Optional[Dict[str, Any]], session_id: str) -> None:
-        self.bridge = bridge
-        self.spec = spec
+    def __init__(self, bridge: Any, enabled: bool, session_id: str) -> None:
         self.session_id = session_id
-        self.target = (spec or {}).get("program_id") or (spec or {}).get("machine_id") or "sandbox"
+        self.manager = None
+        if bridge is not None and enabled:
+            try:
+                from .sandbox_core import SandboxManager
+                self.manager = SandboxManager(bridge)
+            except Exception as exc:  # noqa: BLE001
+                print("DAVINCI_SANDBOX " + json.dumps({"init_error": repr(exc)[:160]}), flush=True)
 
-    def _signal(self, action: str) -> None:
-        if self.bridge is None or self.spec is None:
+    def _drive(self, action: str) -> None:
+        if self.manager is None:
             return
         try:
-            self.bridge.signal_user(
-                "creatures/signal",
-                str(self.target),
-                {
-                    "kind": "invoke",
-                    "tool_id": "sandbox_pc",
-                    "function": action,
-                    "action": action,
-                    "payload": {"sessionId": self.session_id},
-                },
-            )
-            print("DAVINCI_SANDBOX " + json.dumps({"action": action, "session": self.session_id}),
-                  flush=True)
+            fn = self.manager.start if action == "start" else self.manager.suspend
+            res = fn(self.session_id)
+            print("DAVINCI_SANDBOX " + json.dumps(
+                {"action": action, "session": self.session_id,
+                 "ok": res.get("ok"), "vmId": res.get("vmId"), "runtime": res.get("runtime")}),
+                flush=True)
         except Exception as exc:  # noqa: BLE001
             print("DAVINCI_SANDBOX " + json.dumps({"error": repr(exc)[:160], "action": action}),
                   flush=True)
 
     def __enter__(self) -> "_SessionSandbox":
-        self._signal("start")
+        self._drive("start")
         return self
 
     def __exit__(self, *_exc: Any) -> None:
         # Idle path: turn off but KEEP the persistent disk. The next prompt for
         # this session will wake it transparently via the host's wake-on-exec.
-        self._signal("suspend")
+        self._drive("suspend")
 
 
 class BridgeCreatureExecutor:
@@ -372,13 +369,13 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     # Per-session sandbox VM lifecycle: warm before the loop, suspend after.
     # No-op when no sandbox_pc tool is configured or no bridge is available.
-    sandbox_spec = _find_sandbox_tool_spec(tools_by_name) if bridge is not None else None
+    sandbox_enabled = bridge is not None and _sandbox_enabled(tools_by_name)
     session_id = (
         task.get("session_id")
         or task.get("sessionId")
         or (f"davinci-{bridge.session_id}" if bridge and getattr(bridge, "session_id", None) else "davinci-default")
     )
-    with _SessionSandbox(bridge, sandbox_spec, session_id):
+    with _SessionSandbox(bridge, sandbox_enabled, session_id):
         result = agent.run(objective, required_categories=required)
     print("DAVINCI_RESULT " + json.dumps(result.to_dict()), flush=True)
     return 0 if result.success else 2

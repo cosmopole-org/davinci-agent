@@ -233,6 +233,12 @@ def deploy_tool(c: CasparSignalingClient, tool: dict) -> dict:
     bridge_py = REPO / "davinci" / "caspar_bridge.py"
     if bridge_py.exists():
         files["caspar_bridge.py"] = b64_file(bridge_py)
+    # Ship the shared sandbox manager so the sandbox_pc tool can drive per-session
+    # VMs directly through the vmm host APIs (no intermediary creature). Harmless
+    # for other tools, which simply never import it.
+    sandbox_core_py = REPO / "davinci" / "sandbox_core.py"
+    if sandbox_core_py.exists():
+        files["sandbox_core.py"] = b64_file(sandbox_core_py)
     tool_py = tool_dir / "tool.py"
     if tool_py.exists():
         files["tool.py"] = b64_file(tool_py)

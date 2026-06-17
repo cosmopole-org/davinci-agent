@@ -23,6 +23,7 @@ import hashlib
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Protocol
 
+from .attachments import Attachment
 from .memory import EpisodicMemory, InstructionMemory, WorkingMemory
 from .mcp import ToolDescriptor, ToolRegistry
 from .observability import Budget, Tracer
@@ -161,9 +162,20 @@ class DavinciAgent:
 
     # -- public API ----------------------------------------------------------
     def run(self, objective: str, required_categories: Optional[List[str]] = None,
-            replan_budget: int = 1) -> RunResult:
+            replan_budget: int = 1,
+            attachments: Optional[List[Attachment]] = None) -> RunResult:
+        # Multimodal attachments accompanying the user prompt: surface them on
+        # the working memory so reasoners that understand multimodal input
+        # (e.g. GeminiReasoner) can attach them to their LLM calls. The
+        # deterministic HeuristicReasoner simply ignores them.
+        atts = list(attachments or [])
+        if atts:
+            self.working.set_fact("attachments", atts)
+            self.working.remember("user_attachments",
+                                  [a.to_dict() for a in atts])
         self._record("run_start", f"Starting objective: {objective}",
-                     instructions=self.instructions.render() or None)
+                     instructions=self.instructions.render() or None,
+                     attachments=[a.to_dict() for a in atts] or None)
         plan = self.planner.plan(objective, required_categories)
         self._record("plan", "Generated execution plan", plan=plan.to_dict())
 

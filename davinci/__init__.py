@@ -8,6 +8,12 @@ The package is intentionally stdlib-only so it runs unmodified inside a slim
 Docker creature deployed on a Caspar node.
 """
 
+from .attachments import (
+    Attachment,
+    attachment_from_file,
+    materialize_attachments,
+    INLINE_MAX_BYTES,
+)
 from .engine import (
     ActionProposal,
     DavinciAgent,
@@ -34,5 +40,6 @@ __all__ = [
     "Tracer", "Budget", "mask_secrets",
     "PermissionEngine", "PermissionMode", "Risk", "Outcome", "Decision", "ToolAction",
     "Plan", "Planner", "PlanStep", "StepStatus",
+    "Attachment", "attachment_from_file", "materialize_attachments", "INLINE_MAX_BYTES",
     "__version__",
 ]

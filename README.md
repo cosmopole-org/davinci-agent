@@ -106,6 +106,40 @@ creature image so TLS verification succeeds inside the sandbox.
 4. **Creature-to-creature** — signal Davinci with a task + tool catalog; Davinci
    logs in and signals the tool creatures *itself*, aggregating their responses.
 
+### Multimodal prompts (file attachments)
+
+Davinci accepts file attachments alongside the user prompt over the same
+signalling API. Build a task with one or more `attachments` entries (each
+`{name, mime_type, data | path, description}`) and ship it as `task.json`:
+
+```python
+from davinci import attachment_from_file
+from davinci.caspar_signaling import CasparSignalingClient
+
+with CasparSignalingClient(host, port) as c:
+    c.login("user")
+    c.run_entity_with_attachments(
+        davinci_program_id, "davinci",
+        objective="Describe what is in this image and crop the receipt.",
+        attachments=["/path/to/photo.jpg", "/path/to/receipt.pdf"],
+        config={"gemini_api_key": "..."},
+    )
+```
+
+End-to-end:
+
+1. The host harness reads each file and inlines its bytes as base64 in the
+   task payload.
+2. The Caspar node uploads `task.json` to `/app/input` inside the davinci
+   docker creature.
+3. The creature decodes each inline attachment and **writes it to its
+   filesystem** at `/app/input/attachments/<name>` (where the agent and any
+   delegated tool creature can read it as a real file).
+4. The `GeminiReasoner` sends the prompt with each attachment as a standard
+   Gemini multimodal `parts[]` entry — inline (`inlineData`) for files
+   ≤ 18 MiB, or uploaded via the **Gemini Files API** (`fileData`/`fileUri`)
+   for larger files. This matches Google's official multimodal contract.
+
 ### Tool-creature contract
 
 A tool creature reads its signal from `/app/input/task.json`

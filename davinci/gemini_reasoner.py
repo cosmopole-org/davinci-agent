@@ -29,6 +29,7 @@ import urllib.error
 import urllib.request
 from typing import Any, Dict, List, Optional
 
+from .attachments import Attachment, INLINE_MAX_BYTES
 from .engine import ActionProposal, HeuristicReasoner, Reflection
 from .mcp import ToolRegistry
 from .memory import WorkingMemory
@@ -38,6 +39,8 @@ from .planning import Plan, PlanStep, StepStatus
 # available when a pinned snapshot is rate-limited or temporarily unavailable.
 DEFAULT_MODELS = ["gemini-flash-latest", "gemini-2.5-flash", "gemini-2.5-pro"]
 API_ROOT = "https://generativelanguage.googleapis.com/v1beta/models"
+FILES_UPLOAD_ROOT = "https://generativelanguage.googleapis.com/upload/v1beta/files"
+FILES_GET_ROOT = "https://generativelanguage.googleapis.com/v1beta"
 
 
 def _ssl_context() -> ssl.SSLContext:
@@ -66,12 +69,29 @@ class GeminiReasoner:
         self._ctx = _ssl_context()
         self._fallback = HeuristicReasoner()
         self.active_model: Optional[str] = None
+        # Cache of uploaded Gemini Files API resources keyed by (path, size, mtime)
+        # so repeat propose/reflect calls don't re-upload the same attachment.
+        self._file_cache: Dict[tuple, Dict[str, str]] = {}
 
     # -- LLM transport -------------------------------------------------------
-    def _generate(self, prompt: str, *, system: str = "") -> Optional[str]:
-        """POST one prompt to Gemini, trying each model + retrying transient 5xx."""
+    def _generate(self, prompt: str, *, system: str = "",
+                  attachments: Optional[List[Attachment]] = None) -> Optional[str]:
+        """POST one prompt to Gemini, trying each model + retrying transient 5xx.
+
+        ``attachments`` are the multimodal parts that accompany the user
+        message; each is sent inline (<= 18 MiB) or, for larger files, uploaded
+        via the Gemini Files API and referenced as ``fileData`` — the standard
+        contract documented at
+        https://ai.google.dev/gemini-api/docs/file-prompting-strategies.
+        """
+        parts: List[Dict[str, Any]] = []
+        for att in (attachments or []):
+            part = self._attachment_part(att)
+            if part is not None:
+                parts.append(part)
+        parts.append({"text": prompt})
         body: Dict[str, Any] = {
-            "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+            "contents": [{"role": "user", "parts": parts}],
             "generationConfig": {"temperature": self.temperature,
                                   "responseMimeType": "application/json"},
         }
@@ -110,6 +130,94 @@ class GeminiReasoner:
                     _emit("transport_error", model=model, error=repr(exc)[:160])
                     break
         return None
+
+    # -- multimodal: attachment → Gemini content part ----------------------
+    def _attachment_part(self, att: Attachment) -> Optional[Dict[str, Any]]:
+        """Return a Gemini ``parts[]`` entry for an attachment, or ``None``.
+
+        Files <= ``INLINE_MAX_BYTES`` are inlined as ``inlineData``; larger
+        files go through the Files API (resumable upload) and are referenced by
+        ``fileData.fileUri``. Either way the model receives a real multimodal
+        part, the same as the official SDKs would produce.
+        """
+        try:
+            data = att.read_bytes()
+        except OSError as exc:
+            _emit("attachment_read_error", name=att.name, error=repr(exc)[:160])
+            return None
+
+        if len(data) <= INLINE_MAX_BYTES:
+            import base64 as _b64
+            return {"inlineData": {"mimeType": att.mime_type,
+                                    "data": _b64.b64encode(data).decode("ascii")}}
+
+        # Large file: upload to the Files API and reference by fileUri.
+        cache_key = (att.path, len(data), self._mtime(att.path))
+        ref = self._file_cache.get(cache_key)
+        if ref is None:
+            ref = self._upload_file(data, att)
+            if ref is None:
+                return None
+            self._file_cache[cache_key] = ref
+        return {"fileData": {"mimeType": ref.get("mimeType") or att.mime_type,
+                              "fileUri": ref["fileUri"]}}
+
+    @staticmethod
+    def _mtime(path: str) -> float:
+        try:
+            return os.path.getmtime(path)
+        except OSError:
+            return 0.0
+
+    def _upload_file(self, data: bytes, att: Attachment) -> Optional[Dict[str, str]]:
+        """Resumable upload to the Gemini Files API; returns ``{fileUri, mimeType}``."""
+        meta = json.dumps({"file": {"displayName": att.name}}).encode()
+        try:
+            req = urllib.request.Request(
+                f"{FILES_UPLOAD_ROOT}?key={self.api_key}",
+                data=meta,
+                headers={
+                    "X-Goog-Upload-Protocol": "resumable",
+                    "X-Goog-Upload-Command": "start",
+                    "X-Goog-Upload-Header-Content-Length": str(len(data)),
+                    "X-Goog-Upload-Header-Content-Type": att.mime_type,
+                    "Content-Type": "application/json; charset=UTF-8",
+                },
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=self.timeout,
+                                         context=self._ctx) as resp:
+                upload_url = resp.headers.get("X-Goog-Upload-URL", "").strip()
+            if not upload_url:
+                _emit("attachment_upload_error", name=att.name,
+                      error="no upload URL in start response")
+                return None
+            req2 = urllib.request.Request(
+                upload_url, data=data,
+                headers={
+                    "Content-Length": str(len(data)),
+                    "X-Goog-Upload-Offset": "0",
+                    "X-Goog-Upload-Command": "upload, finalize",
+                },
+                method="POST",
+            )
+            with urllib.request.urlopen(req2, timeout=self.timeout,
+                                         context=self._ctx) as resp:
+                body = json.loads(resp.read().decode())
+            file_info = body.get("file") or body
+            uri = file_info.get("uri") or ""
+            mime = file_info.get("mimeType") or att.mime_type
+            if not uri:
+                _emit("attachment_upload_error", name=att.name,
+                      error="no uri in finalize response")
+                return None
+            _emit("attachment_uploaded", name=att.name,
+                  fileUri=uri, bytes=len(data))
+            return {"fileUri": uri, "mimeType": mime}
+        except Exception as exc:  # noqa: BLE001
+            _emit("attachment_upload_error", name=att.name,
+                  error=repr(exc)[:200])
+            return None
 
     @staticmethod
     def _extract_text(data: Dict[str, Any]) -> str:
@@ -155,6 +263,7 @@ class GeminiReasoner:
                 entry["arg_schema"] = props
                 entry["required_args"] = (schema or {}).get("required", [])
             catalog.append(entry)
+        attachments = self._attachments_from_memory(memory)
         system = (
             "You are Davinci, an enterprise agent planner. For the CURRENT step you "
             "pick exactly one registered tool to advance the objective, or no tool for "
@@ -165,17 +274,26 @@ class GeminiReasoner:
             "\"args\" using the chosen tool's \"arg_schema\" (use those exact property "
             "names and types) — e.g. provide runnable code for a code arg, a real query "
             "string for a query arg. Only fall back to a generic args.task when the tool "
-            "exposes no arg_schema."
+            "exposes no arg_schema. When the user supplied attachments, they are sent "
+            "alongside this message as standard multimodal parts — inspect them when the "
+            "step needs their content."
         )
-        prompt = json.dumps({
+        prompt_payload: Dict[str, Any] = {
             "objective": objective,
             "current_step": {"title": step.title, "category": step.category,
                              "rationale": step.rationale},
             "available_tools": catalog,
             "recent_memory": self._memory_digest(memory),
-        }, indent=2)
+        }
+        if attachments:
+            prompt_payload["attachments"] = [
+                {"name": a.name, "mime_type": a.mime_type, "size": a.size,
+                 "kind": a.kind, "description": a.description}
+                for a in attachments
+            ]
+        prompt = json.dumps(prompt_payload, indent=2)
 
-        text = self._generate(prompt, system=system)
+        text = self._generate(prompt, system=system, attachments=attachments)
         decision = self._parse_json(text) if text else None
         if not decision:
             _emit("propose_fallback", step=step.title)
@@ -232,6 +350,12 @@ class GeminiReasoner:
                           replan_titles=titles)
 
     # -- helpers -------------------------------------------------------------
+    @staticmethod
+    def _attachments_from_memory(memory: WorkingMemory) -> List[Attachment]:
+        """Recover the run's :class:`Attachment` list from working memory."""
+        atts = memory.get_fact("attachments", []) if hasattr(memory, "get_fact") else []
+        return [a for a in (atts or []) if isinstance(a, Attachment)]
+
     @staticmethod
     def _memory_digest(memory: WorkingMemory, *, roles: tuple = (),
                        limit: int = 8) -> List[Dict[str, str]]:

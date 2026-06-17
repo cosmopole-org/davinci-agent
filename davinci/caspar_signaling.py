@@ -161,6 +161,46 @@ class CasparSignalingClient:
             raise RuntimeError(f"deploy failed: {r}")
         return r
 
+    def run_entity_with_attachments(
+        self, program_id: str, entity_id: str, *,
+        objective: str,
+        attachments: Optional[List[Any]] = None,
+        task_extra: Optional[Dict[str, Any]] = None,
+        config: Optional[Dict[str, Any]] = None,
+        ram_mb: int = 512, disk_gb: int = 1, cpu_cores: int = 1,
+        max_exec_seconds: int = 240,
+    ) -> str:
+        """Signal a Davinci creature with a multimodal prompt.
+
+        ``attachments`` is a list of either local file paths (the bytes are read
+        and base64-encoded inline) or dicts conforming to the ``task.json``
+        attachment spec (``{name, mime_type, data | path, description}``). The
+        composed payload is delivered to ``/app/input/task.json``; the davinci
+        creature materialises each inline attachment to
+        ``/app/input/attachments/<name>`` before invoking the agent loop.
+        """
+        from .attachments import attachment_from_file
+        attach_specs: List[Dict[str, Any]] = []
+        for entry in attachments or []:
+            if isinstance(entry, str):
+                attach_specs.append(attachment_from_file(entry))
+            elif isinstance(entry, dict):
+                attach_specs.append(entry)
+            else:
+                raise TypeError(f"unsupported attachment: {entry!r}")
+        task: Dict[str, Any] = {"objective": objective}
+        if attach_specs:
+            task["attachments"] = attach_specs
+        if task_extra:
+            task.update(task_extra)
+        params: Dict[str, str] = {"task.json": json.dumps(task)}
+        if config:
+            params["config.json"] = json.dumps(config)
+        return self.run_entity(program_id, entity_id, params=params,
+                               ram_mb=ram_mb, disk_gb=disk_gb,
+                               cpu_cores=cpu_cores,
+                               max_exec_seconds=max_exec_seconds)
+
     def run_entity(self, program_id: str, entity_id: str, *, params: Optional[Dict[str, str]] = None,
                    ram_mb: int = 512, disk_gb: int = 1, cpu_cores: int = 1,
                    max_exec_seconds: int = 120) -> str:

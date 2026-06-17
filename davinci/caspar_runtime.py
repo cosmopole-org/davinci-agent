@@ -32,6 +32,7 @@ import os
 import sys
 from typing import Any, Dict, List, Optional
 
+from .attachments import Attachment, materialize_attachments
 from .engine import DavinciAgent, EchoExecutor, ToolResult
 from .mcp import ToolDescriptor, ToolRegistry
 from .observability import Budget, Tracer
@@ -290,6 +291,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     objective = task.get("objective") or "Run a self-test and report Davinci capabilities."
     required = task.get("required_categories") or []
 
+    # Multimodal attachments: decode any inline base64 data from task.json and
+    # write each payload to /app/input/attachments/<name>. The agent and any
+    # multimodal-capable reasoner (e.g. Gemini) then sees real files on disk.
+    attachments: List[Attachment] = materialize_attachments(task, INPUT_DIR)
+    if attachments:
+        print("DAVINCI_ATTACHMENTS " + json.dumps(
+            {"count": len(attachments),
+             "items": [a.to_dict() for a in attachments]}), flush=True)
+
     # Live mode: signal sibling tool creatures through the node over the bridge.
     # Configuration (an optional tool catalog) is delivered as an input file by
     # the signal that started us.
@@ -376,7 +386,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         or (f"davinci-{bridge.session_id}" if bridge and getattr(bridge, "session_id", None) else "davinci-default")
     )
     with _SessionSandbox(bridge, sandbox_enabled, session_id):
-        result = agent.run(objective, required_categories=required)
+        result = agent.run(objective, required_categories=required,
+                           attachments=attachments)
     print("DAVINCI_RESULT " + json.dumps(result.to_dict()), flush=True)
     return 0 if result.success else 2
 

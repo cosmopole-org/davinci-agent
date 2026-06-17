@@ -13,14 +13,14 @@ davinci  ──signal──►  sandbox WASM creature  ──hostCall──►  
    ▲                                                         (persistent
    └──────── result (correlationId match) ─────────          disk under
                                                               {storage}/vms/
-                                                              <machine>/<vm>)
+                                                              <vm>)
 ```
 
 Each davinci session keeps its own fire VM, keyed by `session_id`. The VM is
 owned by the sandbox creature that ran it — fire VMs are not bound 1:1 with a
 store; a single creature (whether a member of a store or not) can run unlimited
 fire VMs in parallel, each in its own non-escapable directory under
-`{STORAGE_ROOT_PATH}/vms/<machine>/<vm>`.
+`{STORAGE_ROOT_PATH}/vms/<vm>`.
 
 ## Lifecycle
 

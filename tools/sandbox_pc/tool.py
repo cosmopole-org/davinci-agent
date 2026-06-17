@@ -14,7 +14,7 @@ Lifecycle, end to end:
   envelope carrying ``{action, payload, correlationId, reply_to}``.
 * The sandbox creature calls ``execVm`` on the Caspar host. The host wakes a
   suspended VM transparently (wake-on-exec) on its persistent disk under
-  ``{STORAGE_ROOT_PATH}/vms/<machine>/<vm>``, runs the command, and returns the
+  ``{STORAGE_ROOT_PATH}/vms/<vm>``, runs the command, and returns the
   shell output.
 * The sandbox creature signals ``creatures/signal/result`` back to davinci,
   matched by ``correlationId``. We return it to the agent.

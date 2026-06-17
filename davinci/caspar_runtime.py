@@ -364,7 +364,16 @@ def main(argv: Optional[List[str]] = None) -> int:
     snapshot["live_signaling"] = live
     snapshot["discovery"] = discovery
     snapshot["llm_provider"] = llm_provider
-    print("DAVINCI_BOOT " + json.dumps({"task": task, "capabilities": snapshot}), flush=True)
+    # Echo a copy of the task without the (potentially massive) attachment payload
+    # so the BOOT sentinel stays one short, parseable line in the VM logs.
+    task_summary = {k: v for k, v in task.items() if k != "attachments"}
+    if task.get("attachments"):
+        task_summary["attachments"] = [
+            {kk: vv for kk, vv in (a.items() if isinstance(a, dict) else [])
+             if kk in ("name", "mime_type", "description", "path")}
+            for a in task["attachments"]
+        ]
+    print("DAVINCI_BOOT " + json.dumps({"task": task_summary, "capabilities": snapshot}), flush=True)
 
     tracer = Tracer(stream=True)  # emits DAVINCI_TRACE lines as it goes
     mode = PermissionMode(os.environ.get("DAVINCI_PERMISSION_MODE", mode_default))

@@ -23,7 +23,8 @@
       "desc": "run a shell command inside the session's persistent fire VM; auto-wakes the VM if it was suspended",
       "args": {
         "command": {"type": "STRING", "desc": "shell command to execute"},
-        "session_id": {"type": "STRING", "desc": "optional davinci session id (one fire VM per session)"},
+        "session_id": {"type": "STRING", "desc": "optional davinci session id (one VM per session)"},
+        "runtime": {"type": "STRING", "desc": "sandbox VM runtime: 'fire' (Firecracker, default) or 'docker'"},
         "timeout_seconds": {"type": "NUMBER", "desc": "optional per-command timeout (default 60)"}
       }
     },

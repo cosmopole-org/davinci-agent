@@ -179,6 +179,20 @@ def test_session_sandbox_is_noop_without_spec():
     assert bridge.sent == []
 
 
+def test_exec_passes_runtime_to_sandbox_creature():
+    bridge = _FakeBridge(reply_with={"ok": True, "output": "container-OK\n", "runtime": "docker"})
+    mod = _load_tool_module(lambda: bridge)
+
+    out = mod.invoke("exec", {"command": "echo container-OK", "runtime": "docker"})
+
+    assert out["ok"] is True
+    pkt = bridge.sent[0]["packet"]
+    # The runtime field flows through the envelope to the sandbox creature so
+    # the host routes to the docker controller instead of the fire one.
+    assert pkt["payload"]["runtime"] == "docker"
+    assert pkt["payload"]["command"] == "echo container-OK"
+
+
 def test_session_sandbox_is_noop_without_bridge():
     from davinci import caspar_runtime as rt
     spec = {"tool_id": "sandbox_pc", "machine_id": "m"}

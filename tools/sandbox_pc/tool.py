@@ -142,6 +142,16 @@ def _signal_sandbox(action: str, payload: Dict[str, Any], *, timeout: float) -> 
     correlation_id = uuid.uuid4().hex
     session_id = _session_id(payload)
 
+    # Sandbox VM runtime: "fire" (Firecracker microVM) or "docker" (gVisor
+    # container). The sandbox creature drives both; the default mirrors the
+    # creature's own default ("fire"). A caller can pin "docker" when KVM is
+    # unavailable.
+    inner_payload = {k: v for k, v in payload.items() if k not in ("sandbox_target",)}
+    inner_payload["sessionId"] = session_id
+    runtime = payload.get("runtime") or os.environ.get("SANDBOX_PC_RUNTIME")
+    if runtime:
+        inner_payload["runtime"] = runtime
+
     # Match the envelope shape the sandbox creature's unwrapSignal() expects.
     envelope: Dict[str, Any] = {
         "kind": "invoke",
@@ -150,10 +160,7 @@ def _signal_sandbox(action: str, payload: Dict[str, Any], *, timeout: float) -> 
         "tool_id": "sandbox_pc",
         "function": action,
         "action": action,
-        "payload": {
-            **{k: v for k, v in payload.items() if k not in ("sandbox_target",)},
-            "sessionId": session_id,
-        },
+        "payload": inner_payload,
     }
 
     ev = threading.Event()

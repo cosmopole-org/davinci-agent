@@ -373,11 +373,20 @@ def _run_agent(bridge: Any, task: Dict[str, Any], config: Dict[str, Any],
     ).lower()
     risk_ceiling = {"low": Risk.LOW, "medium": Risk.MEDIUM, "high": Risk.HIGH}.get(
         _ceiling_name, Risk.HIGH)
+    # LLM-backed planning: when the reasoner can decompose the objective itself
+    # (Gemini), plan with concrete, executable steps instead of generic
+    # category placeholders, so each step yields real tool arguments.
+    planner = None
+    if reasoner is not None and hasattr(reasoner, "make_plan"):
+        from .planning import Planner
+        planner = Planner(strategy=lambda obj, cats: reasoner.make_plan(obj, cats, registry))
+
     agent = DavinciAgent(
         registry=registry,
         permissions=PermissionEngine(mode=mode, risk_ceiling=risk_ceiling),
         reasoner=reasoner,  # None -> engine default (HeuristicReasoner)
         executor=executor,
+        planner=planner,    # None -> engine default (deterministic Planner)
         tracer=tracer,
         budget=Budget(max_steps=int(os.environ.get("DAVINCI_MAX_STEPS", "20"))),
     )

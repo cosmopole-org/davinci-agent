@@ -248,6 +248,14 @@ class GeminiReasoner:
     # -- Reasoner protocol ---------------------------------------------------
     def propose(self, objective: str, step: PlanStep, registry: ToolRegistry,
                 memory: WorkingMemory) -> ActionProposal:
+        # The final synthesis is handled once, at end-of-run, with the full
+        # untruncated tool results (see ``synthesize``). Skipping a per-step
+        # answer here avoids committing to a low-quality answer built from the
+        # truncated step memory.
+        if step.category == "synthesis":
+            return ActionProposal(
+                tool=None,
+                thought="final answer deferred to end-of-run synthesis over full results")
         # Include each tool's input schema so the model emits arguments that match
         # the tool's real contract (this is what makes Path A / schema-rich
         # discovery pay off — e.g. python_exec wants `code`, web_search `query`).
@@ -318,6 +326,118 @@ class GeminiReasoner:
               tool=tool.name if tool else None)
         return ActionProposal(tool=tool, args=args, thought=thought)
 
+    def make_plan(self, objective: str, required_categories: List[str],
+                  registry: ToolRegistry) -> Plan:
+        """LLM-backed planning strategy: decompose the *actual* objective into a
+        concrete, ordered, executable sequence of steps.
+
+        This is what lets the agent do real work: instead of generic
+        ``Execute '<category>' work`` placeholders, each step carries a concrete
+        instruction (which URL to fetch, what to extract, what to compute), so
+        the per-step ``propose`` call can emit real tool arguments. Falls back to
+        the deterministic heuristic plan on any LLM/parse failure.
+        """
+        from .planning import Planner as _Planner  # local import avoids a cycle
+
+        tools = [t.stub() for t in registry.all()]
+        categories = sorted({t.get("category", "general") for t in tools} |
+                            {"analysis", "verification", "synthesis"})
+        system = (
+            "You are Davinci's planner. Decompose the objective into a CONCRETE, "
+            "ordered, minimal sequence of executable steps that actually accomplish "
+            "it end to end using the available tools. Each step's \"title\" must be a "
+            "specific, actionable instruction (name the exact URL, data, or "
+            "computation — never a vague 'do the research' placeholder). Pick each "
+            "step's \"category\" from the provided list so it routes to a matching "
+            "tool. Keep it tight (5-9 steps). The LAST step MUST have category "
+            "\"synthesis\" and produce the final answer, honoring any output-format "
+            "constraint stated in the objective. Reply with a single JSON object: "
+            "{\"steps\": [{\"title\": str, \"category\": str, \"rationale\": str}, ...]}."
+        )
+        prompt = json.dumps({
+            "objective": objective,
+            "available_categories": categories,
+            "available_tools": tools,
+        }, indent=2)
+        text = self._generate(prompt, system=system)
+        decision = self._parse_json(text) if text else None
+        steps = (decision or {}).get("steps") if isinstance(decision, dict) else None
+        if not isinstance(steps, list) or not steps:
+            _emit("plan_fallback")
+            return _Planner._heuristic_plan(objective, required_categories)
+
+        plan = Plan(objective=objective)
+        added = 0
+        for s in steps:
+            if not isinstance(s, dict):
+                continue
+            title = str(s.get("title") or "").strip()
+            if not title:
+                continue
+            plan.add_step(title, str(s.get("category") or "general").strip() or "general",
+                          str(s.get("rationale") or "")[:300])
+            added += 1
+        if added == 0:
+            return _Planner._heuristic_plan(objective, required_categories)
+        if plan.steps[-1].category != "synthesis":
+            plan.add_step("Synthesize the final answer in the exact required format",
+                          "synthesis", "Aggregate the gathered results into the final answer.")
+        _emit("plan", model=self.active_model, steps=added)
+        return plan
+
+    def synthesize(self, objective: str, plan: Plan, memory: WorkingMemory) -> Optional[str]:
+        """Produce the FINAL answer from the full set of gathered tool results.
+
+        Runs once at the end of the loop with the *untruncated* tool outputs, and
+        is explicitly instructed to obey any output-format constraint in the
+        objective (e.g. "the output must only be a number"). Returns the final
+        answer string, or ``None`` to let the engine fall back.
+        """
+        results = self._tool_results_full(memory)
+        if not results:
+            return None
+        system = (
+            "You are Davinci. Produce the FINAL answer to the user's objective using "
+            "ONLY the gathered tool results below. Think over the data, do any final "
+            "arithmetic needed, and output the result. CRITICAL: obey the objective's "
+            "output-format constraint EXACTLY — if it says the output must only be a "
+            "number, your \"final_answer\" must be just that number as a string and "
+            "nothing else (no words, units, or punctuation). Reply with a single JSON "
+            "object: {\"final_answer\": <string>}."
+        )
+        prompt = json.dumps({
+            "objective": objective,
+            "tool_results": results,
+            "steps": [{"title": s.title, "status": s.status.value, "result": s.result}
+                      for s in plan.steps],
+        }, indent=2)
+        text = self._generate(prompt, system=system)
+        decision = self._parse_json(text) if text else None
+        if not isinstance(decision, dict):
+            _emit("synthesize_fallback")
+            return None
+        answer = decision.get("final_answer")
+        if answer is None:
+            return None
+        _emit("synthesize", model=self.active_model)
+        return str(answer).strip()
+
+    def _tool_results_full(self, memory: WorkingMemory, *, limit: int = 16,
+                           cap: int = 6000) -> List[Any]:
+        """The run's tool outputs with generous (near-full) detail for synthesis."""
+        items = getattr(memory, "items", []) or []
+        out: List[Any] = []
+        for entry in items:
+            if entry.get("role") != "tool_result":
+                continue
+            content = entry.get("content")
+            if isinstance(content, str):
+                out.append(content[:cap])
+            else:
+                blob = json.dumps(content, default=str)
+                out.append(json.loads(blob) if len(blob) <= cap else blob[:cap])
+        return out[-limit:]
+
     def reflect(self, objective: str, plan: Plan, memory: WorkingMemory) -> Reflection:
         # A hard failure always warrants a heuristic-style replan signal; ask the
         # model to judge satisfaction and (when unsatisfied) propose next steps.
@@ -358,7 +478,7 @@ class GeminiReasoner:
 
     @staticmethod
     def _memory_digest(memory: WorkingMemory, *, roles: tuple = (),
-                       limit: int = 8) -> List[Dict[str, str]]:
+                       limit: int = 8, cap: int = 1500) -> List[Dict[str, str]]:
         items = getattr(memory, "items", []) or []
         out: List[Dict[str, str]] = []
         for entry in items[-limit:]:
@@ -366,8 +486,8 @@ class GeminiReasoner:
             if roles and role not in roles:
                 continue
             content = entry.get("content")
-            text = content if isinstance(content, str) else json.dumps(content)[:400]
-            out.append({"role": role, "content": text[:400]})
+            text = content if isinstance(content, str) else json.dumps(content, default=str)
+            out.append({"role": role, "content": text[:cap]})
         return out
 
 

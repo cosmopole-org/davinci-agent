@@ -252,6 +252,18 @@ class CasparBridgeClient:
         while len(buf) < n:
             try:
                 chunk = sock.recv(n - len(buf))
+            except socket.timeout:
+                # The socket carries a recv timeout (connect timeout). A read
+                # timeout only means "no frame arrived yet" — e.g. while the node
+                # is busy on a slow host call such as a >60s multimodal LLM
+                # httpRequest, nothing is sent on this socket in the meantime.
+                # It is NOT a fatal condition: keep waiting so the reader thread
+                # survives. Treating it as fatal kills the reader, after which
+                # every host call hangs until its own timeout ("host call '<op>'
+                # timed out"). Only stop if the client is being closed.
+                if self._closed.is_set():
+                    return None
+                continue
             except OSError:
                 return None
             if not chunk:

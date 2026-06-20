@@ -30,6 +30,7 @@ import glob
 import json
 import os
 import sys
+import time
 from typing import Any, Dict, List, Optional
 
 from .attachments import Attachment, materialize_attachments
@@ -151,8 +152,17 @@ class BridgeCreatureExecutor:
             return ToolResult(ok=False, output=None, error=f"no target machine for tool {tool.name}")
         payload = {k: v for k, v in (action.args or {}).items() if v is not None}
         correlation_id = uuid.uuid4().hex
+        # ``entityId`` is REQUIRED for the node to cold-spawn the right tool
+        # creature: when no live tool connection exists the node's machine
+        # listener resolves the per-entity docker image via
+        # ``vmEntityPath::<machine>::<entityId>``. Without it the spawn falls back
+        # to the program default and the tool image is never located, so the
+        # invoke silently never runs and the caller times out. The node parses it
+        # off the signal envelope (``stores::Send.entityId``).
+        entity_id = spec.get("entity_id") or spec.get("tool_id", tool.name)
         packet = {
             "kind": "invoke",
+            "entityId": entity_id,
             "correlationId": correlation_id,
             "reply_to": self.my_id,
             "tool_id": spec.get("tool_id", tool.name),
@@ -168,7 +178,12 @@ class BridgeCreatureExecutor:
             return ToolResult(ok=False, output=None, error=f"bridge signal failed: {exc}")
         if isinstance(ack, dict) and ack.get("ok") is False:
             return ToolResult(ok=False, output={"ack": ack}, error="node rejected tool signal")
-        timeout = float(spec.get("max_exec_seconds", 75))
+        # A sibling tool creature is usually *cold-spawned* on demand: the node
+        # builds/starts its container, uploads the task, the tool connects to the
+        # gateway, runs, and signals its result back. That whole round-trip can
+        # take well over a minute under gVisor, so the default reply timeout is
+        # generous (overridable per-tool via ``max_exec_seconds``).
+        timeout = float(spec.get("max_exec_seconds", 240))
         delivered = ev.wait(timeout)
         with self._lock:
             self._waiters.pop(correlation_id, None)
@@ -285,49 +300,27 @@ def _version() -> str:
         return "0.0.0"
 
 
-def main(argv: Optional[List[str]] = None) -> int:
-    argv = argv if argv is not None else sys.argv[1:]
-    task = _read_task()
+def _run_agent(bridge: Any, task: Dict[str, Any], config: Dict[str, Any],
+               attachments: List[Attachment]) -> tuple:
+    """Build the agent from the (signal-delivered) task + config and run it.
+
+    Returns ``(result, result_dict)``. The tool catalog and LLM config travel
+    *with the task* over the signaling API; nothing is read from a task file in
+    the gateway path.
+    """
     objective = task.get("objective") or "Run a self-test and report Davinci capabilities."
     required = task.get("required_categories") or []
-
-    # Multimodal attachments: decode any inline base64 data from task.json and
-    # write each payload to /app/input/attachments/<name>. The agent and any
-    # multimodal-capable reasoner (e.g. Gemini) then sees real files on disk.
-    attachments: List[Attachment] = materialize_attachments(task, INPUT_DIR)
-    if attachments:
-        print("DAVINCI_ATTACHMENTS " + json.dumps(
-            {"count": len(attachments),
-             "items": [a.to_dict() for a in attachments]}), flush=True)
-
-    # Live mode: signal sibling tool creatures through the node over the bridge.
-    # Configuration (an optional tool catalog) is delivered as an input file by
-    # the signal that started us.
-    config = _read_config()
     tools = config.get("tools") or []
 
     executor: Any = EchoExecutor()
     discovery = "none"
-    mode_default = "auto"
     live = False
     tools_by_name: Dict[str, Dict[str, Any]] = {}
 
-    # Gateway path: when the node injected CASPAR_GATEWAY_* env, this container
-    # is a gateway-managed docker creature and the bridge is its *only* route to
-    # the outside world. A docker creature is bridge-or-nothing — it never opens
-    # the external Caspar client protocol (that is reserved for host-side
-    # deployers/CLIs, not for sandboxed creatures).
-    bridge = None
-    try:
-        from .caspar_bridge import bridge_from_env
-        bridge = bridge_from_env()
-    except Exception as exc:  # noqa: BLE001 — fall back to the offline path
-        print("DAVINCI_BOOT " + json.dumps({"bridge_init_error": repr(exc)[:160]}), flush=True)
-        bridge = None
-
     if bridge is not None:
         # Use the node-assigned identity reported in the WELCOME handshake — the
-        # container never declares its own id.
+        # container never declares its own id. Davinci drives sibling tool
+        # creatures purely by signalling their live VMs over the gateway.
         my_id = bridge.machine_id or bridge.program_id or ""
         tools_by_name = {t.get("name") or f"caspar__{t['tool_id']}": t for t in tools}
         registry = _registry_from_tool_catalog(tools) if tools else _build_registry()
@@ -337,19 +330,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         if not required:
             required = list(dict.fromkeys(
                 t.get("category", "general") for t in tools_by_name.values()))[:4]
-        print("DAVINCI_BRIDGE " + json.dumps({
-            "connected": True, "session": bridge.session_id, "vm_id": os.environ.get("CASPAR_VM_ID", ""),
-            "tools": list(tools_by_name.keys())}), flush=True)
     else:
-        # Not gateway-managed (offline / local self-test): run with the built-in
-        # capability set. No external Caspar client connection is ever opened
-        # from inside a creature.
+        # Offline / local self-test: built-in capability set, no signalling.
         registry = _build_registry()
-        live = False
 
     # LLM backbone: use Gemini as the reasoner when an API key is supplied via
-    # the live config (config.json) or the GEMINI_API_KEY env var. Any failure to
-    # construct it leaves the deterministic HeuristicReasoner in place.
+    # the task's config. Any failure leaves the deterministic HeuristicReasoner.
     reasoner: Any = None
     llm_provider = "heuristic"
     try:
@@ -364,9 +350,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     snapshot["live_signaling"] = live
     snapshot["discovery"] = discovery
     snapshot["llm_provider"] = llm_provider
-    # Echo a copy of the task without the (potentially massive) attachment payload
-    # so the BOOT sentinel stays one short, parseable line in the VM logs.
-    task_summary = {k: v for k, v in task.items() if k != "attachments"}
+    task_summary = {k: v for k, v in task.items() if k not in ("attachments", "config")}
     if task.get("attachments"):
         task_summary["attachments"] = [
             {kk: vv for kk, vv in (a.items() if isinstance(a, dict) else [])
@@ -376,18 +360,28 @@ def main(argv: Optional[List[str]] = None) -> int:
     print("DAVINCI_BOOT " + json.dumps({"task": task_summary, "capabilities": snapshot}), flush=True)
 
     tracer = Tracer(stream=True)  # emits DAVINCI_TRACE lines as it goes
-    mode = PermissionMode(os.environ.get("DAVINCI_PERMISSION_MODE", mode_default))
+    mode = PermissionMode(os.environ.get("DAVINCI_PERMISSION_MODE", "auto"))
+    # Risk ceiling for autonomous (auto-mode) tool execution. The agent runs
+    # unattended as a creature, so network/automation tools (web fetch, headless
+    # browser) are legitimately part of the job and must be runnable without a
+    # human reviewer. Configurable (task config ``risk_ceiling`` or the
+    # DAVINCI_RISK_CEILING env); defaults to ``high`` so a deployed agent can
+    # actually use its high-risk tool creatures; lower it to harden a deployment.
+    _ceiling_name = str(
+        config.get("risk_ceiling")
+        or os.environ.get("DAVINCI_RISK_CEILING", "high")
+    ).lower()
+    risk_ceiling = {"low": Risk.LOW, "medium": Risk.MEDIUM, "high": Risk.HIGH}.get(
+        _ceiling_name, Risk.HIGH)
     agent = DavinciAgent(
         registry=registry,
-        permissions=PermissionEngine(mode=mode, risk_ceiling=Risk.MEDIUM),
+        permissions=PermissionEngine(mode=mode, risk_ceiling=risk_ceiling),
         reasoner=reasoner,  # None -> engine default (HeuristicReasoner)
         executor=executor,
         tracer=tracer,
         budget=Budget(max_steps=int(os.environ.get("DAVINCI_MAX_STEPS", "20"))),
     )
 
-    # Per-session sandbox VM lifecycle: warm before the loop, suspend after.
-    # No-op when no sandbox_pc tool is configured or no bridge is available.
     sandbox_enabled = bridge is not None and _sandbox_enabled(tools_by_name)
     session_id = (
         task.get("session_id")
@@ -397,7 +391,113 @@ def main(argv: Optional[List[str]] = None) -> int:
     with _SessionSandbox(bridge, sandbox_enabled, session_id):
         result = agent.run(objective, required_categories=required,
                            attachments=attachments)
-    print("DAVINCI_RESULT " + json.dumps(result.to_dict()), flush=True)
+    result_dict = result.to_dict()
+    print("DAVINCI_RESULT " + json.dumps(result_dict), flush=True)
+    return result, result_dict
+
+
+def _wait_for_task_signal(bridge: Any, timeout: float) -> tuple:
+    """Block until the agent's task arrives over the signaling API.
+
+    The task is delivered as a ``/creatures/signal`` (pvp) which the node wraps
+    as ``StoresSend{user, data:"<json>"}`` and pushes onto our gateway
+    connection. We capture it on the bridge reader thread (no host calls there)
+    and hand it to the main thread, which runs the agent loop.
+
+    Returns ``(task, reply_to, correlation_id)`` or ``(None, None, None)``.
+    """
+    import threading
+
+    box: Dict[str, Any] = {}
+    ev = threading.Event()
+
+    def on_signal(key: str, data: Any) -> None:
+        if key != "creatures/signal" or not isinstance(data, dict):
+            return
+        inner = data.get("data")
+        if isinstance(inner, str):
+            try:
+                inner = json.loads(inner)
+            except Exception:  # noqa: BLE001
+                return
+        if not isinstance(inner, dict):
+            inner = data
+        # Only act on a task delivery, not on unrelated signals.
+        if inner.get("kind") != "task" and "objective" not in inner:
+            return
+        box["task"] = inner
+        box["reply_to"] = inner.get("reply_to") or (data.get("user") or {}).get("id")
+        box["correlationId"] = inner.get("correlationId")
+        ev.set()
+
+    bridge.on_signal(on_signal)
+    print("DAVINCI_READY " + json.dumps(
+        {"machine_id": getattr(bridge, "machine_id", ""),
+         "program_id": getattr(bridge, "program_id", ""),
+         "session": bridge.session_id, "ts": time.time()}), flush=True)
+    if not ev.wait(timeout):
+        return None, None, None
+    return box.get("task"), box.get("reply_to"), box.get("correlationId")
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    argv = argv if argv is not None else sys.argv[1:]
+
+    # Gateway path: when the node injected CASPAR_GATEWAY_* env, this container is
+    # a gateway-managed docker creature and the bridge is its *only* channel. The
+    # agent's task (objective + tool catalog + LLM config) is delivered over the
+    # signaling API — never via an uploaded task file.
+    bridge = None
+    try:
+        from .caspar_bridge import bridge_from_env
+        bridge = bridge_from_env()
+    except Exception as exc:  # noqa: BLE001 — fall back to the offline path
+        print("DAVINCI_BOOT " + json.dumps({"bridge_init_error": repr(exc)[:160]}), flush=True)
+        bridge = None
+
+    if bridge is not None:
+        print("DAVINCI_BRIDGE " + json.dumps({
+            "connected": True, "session": bridge.session_id,
+            "vm_id": os.environ.get("CASPAR_VM_ID", ""),
+            "machine_id": getattr(bridge, "machine_id", "")}), flush=True)
+        task, reply_to, correlation_id = _wait_for_task_signal(
+            bridge, float(os.environ.get("DAVINCI_TASK_WAIT", "600")))
+        if not task:
+            print("DAVINCI_RESULT " + json.dumps(
+                {"success": False, "error": "no task signal received within wait window"}), flush=True)
+            try:
+                bridge.close()
+            except Exception:  # noqa: BLE001
+                pass
+            return 2
+        config = task.get("config") or {}
+        attachments = materialize_attachments(task, INPUT_DIR)
+        if attachments:
+            print("DAVINCI_ATTACHMENTS " + json.dumps(
+                {"count": len(attachments), "items": [a.to_dict() for a in attachments]}), flush=True)
+        result, result_dict = _run_agent(bridge, task, config, attachments)
+        # Signal the final result back to the requester over the same API.
+        if reply_to:
+            try:
+                bridge.signal_user("creatures/signal", str(reply_to),
+                                   {"kind": "davinci/result", "correlationId": correlation_id,
+                                    "result": result_dict})
+            except Exception as exc:  # noqa: BLE001
+                print("DAVINCI_BOOT " + json.dumps({"reply_error": repr(exc)[:160]}), flush=True)
+        try:
+            bridge.close()
+        except Exception:  # noqa: BLE001
+            pass
+        return 0 if result.success else 2
+
+    # Offline / local self-test (no gateway): read the task + config from files.
+    task = _read_task()
+    config = _read_config()
+    attachments = materialize_attachments(task, INPUT_DIR)
+    if attachments:
+        print("DAVINCI_ATTACHMENTS " + json.dumps(
+            {"count": len(attachments), "items": [a.to_dict() for a in attachments]}), flush=True)
+    result, _ = _run_agent(None, task, config, attachments)
     return 0 if result.success else 2
 
 

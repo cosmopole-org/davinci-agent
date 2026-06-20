@@ -39,11 +39,48 @@ import json
 import os
 
 
+# Map the natural action names LLMs commonly emit onto the canonical Playwright
+# step verbs this tool implements, so a model that asks to "navigate" or "wait"
+# (instead of "goto" / "wait_for_*") still drives the browser successfully.
+_ACTION_ALIASES = {
+    "navigate": "goto", "open": "goto", "open_url": "goto", "visit": "goto",
+    "load": "goto", "go": "goto", "goto_url": "goto",
+    "sleep": "wait_for_timeout", "delay": "wait_for_timeout", "pause": "wait_for_timeout",
+    "wait_for": "wait_for_selector", "wait_for_element": "wait_for_selector",
+    "wait_for_navigation": "wait_for_load_state", "wait_for_network": "wait_for_load_state",
+    "get_text": "text", "extract_text": "text", "read_text": "text", "inner_text": "text",
+    "extract": "content", "get_content": "content", "get_html": "content", "html": "content",
+    "page_content": "content", "source": "content",
+    "scroll_down": "scroll", "scroll_to_bottom": "scroll", "scroll_to": "scroll",
+    "eval": "evaluate", "execute_script": "evaluate", "run_script": "evaluate",
+    "snap": "screenshot", "capture": "screenshot", "shot": "screenshot",
+    "back": "go_back", "attribute": "get_attribute", "attr": "get_attribute",
+}
+
+
+def _resolve_action(step: dict) -> str:
+    action = (step.get("action") or step.get("op") or "").lower().strip()
+    # ``wait`` is ambiguous: pick the concrete verb from the step's own fields.
+    if action == "wait":
+        if step.get("selector"):
+            return "wait_for_selector"
+        if any(k in step for k in ("ms", "timeout", "seconds", "duration")):
+            return "wait_for_timeout"
+        return "wait_for_load_state"
+    return _ACTION_ALIASES.get(action, action)
+
+
 def _run_step(page, step: dict, default_timeout: int) -> dict:
-    action = (step.get("action") or step.get("op") or "").lower()
+    action = _resolve_action(step)
     sel = step.get("selector")
     timeout = int(step.get("timeout_ms", default_timeout))
     out = {"action": action}
+
+    if action == "wait_for_timeout" and "ms" not in step:
+        # Honour seconds/duration aliases when an LLM expresses the pause that way.
+        secs = step.get("seconds", step.get("duration"))
+        if secs is not None:
+            step = {**step, "ms": int(float(secs) * 1000)}
 
     if action == "goto":
         resp = page.goto(step["url"], timeout=timeout,

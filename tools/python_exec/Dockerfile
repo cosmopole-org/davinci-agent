@@ -11,6 +11,9 @@ COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir \
     --trusted-host pypi.org --trusted-host files.pythonhosted.org --trusted-host pypi.python.org \
     -r requirements.txt
+# Install Chromium + its OS dependencies so executed code can render JS-heavy
+# pages via Playwright when a static fetch is insufficient.
+RUN python -m playwright install --with-deps chromium
 
 COPY . /app
 

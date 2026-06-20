@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 
 
 def _run_step(page, step: dict, default_timeout: int) -> dict:
@@ -143,18 +144,32 @@ def invoke(function_name: str, payload: dict) -> dict:
     results = []
     ok_all = True
 
+    # Tool creatures reach the network through a TLS-intercepting egress gateway
+    # whose CA is baked into the image as a file bundle (honoured by requests via
+    # REQUESTS_CA_BUNDLE). Chromium, however, uses its own trust store and will
+    # not pick that bundle up, so it would otherwise fail every HTTPS navigation
+    # with net::ERR_CERT_AUTHORITY_INVALID. Default to ignoring cert errors here
+    # (overridable per-call or via env) so the browser can load real sites.
+    ignore_tls = payload.get("ignore_https_errors")
+    if ignore_tls is None:
+        ignore_tls = os.environ.get(
+            "BROWSER_IGNORE_HTTPS_ERRORS", "1").strip().lower() not in ("0", "false", "no", "")
+
     try:
         with sync_playwright() as pw:
             launcher = getattr(pw, browser_name)
+            chromium_args = ["--no-sandbox", "--disable-dev-shm-usage"]
+            if ignore_tls:
+                chromium_args.append("--ignore-certificate-errors")
             browser = launcher.launch(headless=headless,
-                                      args=["--no-sandbox", "--disable-dev-shm-usage"]
+                                      args=chromium_args
                                       if browser_name == "chromium" else None)
             ctx_kwargs = {}
             if payload.get("viewport"):
                 ctx_kwargs["viewport"] = payload["viewport"]
             if payload.get("user_agent"):
                 ctx_kwargs["user_agent"] = payload["user_agent"]
-            if payload.get("ignore_https_errors"):
+            if ignore_tls:
                 ctx_kwargs["ignore_https_errors"] = True
             context = browser.new_context(**ctx_kwargs)
             context.set_default_timeout(default_timeout)

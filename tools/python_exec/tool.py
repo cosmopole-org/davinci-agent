@@ -81,8 +81,11 @@ def _set_rlimits():  # pragma: no cover - only runs in child process on POSIX
     """Bound the child's CPU time and address space as a defence in depth."""
     try:
         import resource
-        resource.setrlimit(resource.RLIMIT_CPU, (60, 90))
-        soft = 1536 * 1024 * 1024
+        resource.setrlimit(resource.RLIMIT_CPU, (120, 150))
+        # Roomy enough for pandas/numpy and a headless Chromium (via Playwright)
+        # while still bounding a runaway allocation. gVisor provides the hard
+        # isolation boundary around the whole creature.
+        soft = 4096 * 1024 * 1024
         resource.setrlimit(resource.RLIMIT_AS, (soft, soft))
         resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
     except Exception:

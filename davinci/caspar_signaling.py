@@ -239,13 +239,44 @@ class CasparSignalingClient:
         creature emits, matched by ``correlationId``.
         """
         correlation_id = uuid.uuid4().hex
-        data = json.dumps({"action": action, "programId": program_id, "entity": entity,
-                           "correlationId": correlation_id, "payload": payload})
+        # The miniapp creature's ``unwrapSignal`` parses a *doubly*-encoded
+        # envelope (matching the Decillion CLI / bench client exactly):
+        #   data    = {"correlationId": cid, "payload": <inner JSON string>}
+        #   inner   = {"action": <action>, "payload": {...args..., correlationId}}
+        # ``inner.action`` becomes the dispatched path and ``inner.payload`` the
+        # action args. Encoding ``action``/``payload`` at the wrong level (a raw
+        # dict, or ``action`` at the data layer) makes the creature read an empty
+        # path and silently no-op, so we mirror the working client byte-for-byte.
+        inner_payload = json.dumps({
+            "action": action,
+            "payload": {**(payload or {}), "correlationId": correlation_id},
+        })
+        data = json.dumps({"correlationId": correlation_id, "payload": inner_payload})
         # "pvp" is the node's program-targeted signal type: it delivers the
         # packet to the target program (creatureId/programId) which runs its
         # entity and signals the result back to us.
         req = {"type": "pvp", "data": data, "creatureId": creature_id,
-               "programId": program_id, "entityId": entity, "storeId": store_id}
+               "programId": program_id, "entityId": entity, "storeId": store_id,
+               "temp": False}
+        return self._signal_await_result("/creatures/signal", req, correlation_id, timeout)
+
+    def signal_entity_await(self, *, creature_id: str, program_id: str, entity_id: str,
+                            envelope: Dict[str, Any], timeout: float = 120.0) -> Dict[str, Any]:
+        """Signal a *running* creature VM (docker tool or the Davinci agent) and
+        await its correlated reply — purely over the signaling API.
+
+        This is how an external client hands work to a standalone creature: a
+        ``/creatures/signal`` (pvp) carrying ``envelope`` is delivered by the node
+        as a pushed signal onto the creature's live gateway connection; the
+        creature processes it and signals a reply back to *this* client (its
+        ``user_id``), matched by ``correlationId``. The creature is never
+        cold-spawned per call and never reads a task file — it must already be
+        running (started once via ``run_entity``) and serving signals.
+        """
+        correlation_id = uuid.uuid4().hex
+        data = json.dumps({**envelope, "correlationId": correlation_id, "reply_to": self.user_id})
+        req = {"type": "pvp", "data": data, "creatureId": creature_id,
+               "programId": program_id, "entityId": entity_id, "temp": False}
         return self._signal_await_result("/creatures/signal", req, correlation_id, timeout)
 
     def _signal_await_result(self, path: str, payload: Dict[str, Any],

@@ -204,8 +204,12 @@ class DavinciAgent:
             answer = self._run_step(objective, plan, step, pending_review) or answer
 
         success = plan.is_complete and not plan.has_failures and self.budget.exceeded() is None
-        if not answer:
-            answer = self._synthesize(objective, plan)
+        # Final answer: prefer a full-context synthesis over the whole run (the
+        # reasoner aggregates every untruncated tool result and honours the
+        # objective's output-format constraint). Fall back to any step answer,
+        # then to a deterministic summary.
+        final = self._final_answer(objective, plan)
+        answer = final or answer or self._synthesize(objective, plan)
         self._record("run_end", "Run complete", success=success, answer=answer)
         return RunResult(
             objective=objective,
@@ -291,6 +295,23 @@ class DavinciAgent:
         return None
 
     # -- helpers -------------------------------------------------------------
+    def _final_answer(self, objective: str, plan: Plan) -> Optional[str]:
+        """Ask the reasoner to synthesise the final answer from all tool results.
+
+        Optional on the Reasoner protocol — the deterministic HeuristicReasoner
+        does not implement it, so this returns ``None`` there and the engine
+        falls back to its summary.
+        """
+        synth = getattr(self.reasoner, "synthesize", None)
+        if not callable(synth):
+            return None
+        try:
+            answer = synth(objective, plan, self.working)
+        except Exception as exc:  # noqa: BLE001 — never fail the run on synthesis
+            self._record("error", f"synthesis failed: {exc}")
+            return None
+        return answer or None
+
     def _synthesize(self, objective: str, plan: Plan) -> str:
         done = sum(1 for s in plan.steps if s.status == StepStatus.DONE)
         return (f"Completed {done}/{len(plan.steps)} planned steps for objective "

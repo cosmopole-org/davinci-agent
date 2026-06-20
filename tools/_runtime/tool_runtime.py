@@ -203,13 +203,107 @@ def _dispatch(tool_id: str, function: str, payload: dict) -> dict:
     return _h_echo(tool_id, payload)
 
 
-def main() -> int:
-    # Open the single gateway connection first; it is the tool's only channel
-    # to the outside world. No-op when not running as a gateway docker creature.
-    bridge = _connect_bridge()
-    if bridge is not None:
-        print(f"TOOL_BRIDGE {json.dumps({'connected': True, 'session': bridge.session_id})}", flush=True)
+def _extract_invoke(data: dict) -> dict:
+    """Normalise the SIGNAL payload into an ``invoke`` packet.
 
+    Two delivery shapes reach a serving tool, both over the signaling API:
+
+    * **creature → creature** — a sibling creature (e.g. Davinci) calls
+      ``signalUser`` with the invoke packet as the signal value, so ``data`` *is*
+      the packet (``data["kind"] == "invoke"``).
+    * **external client → creature** — a ``/creatures/signal`` (pvp) is wrapped by
+      the node as ``StoresSend{action, user, data:"<json>", entityId}``; the real
+      packet is the JSON string in ``data["data"]``.
+    """
+    if not isinstance(data, dict):
+        return {}
+    if data.get("kind") == "invoke" or "tool_id" in data or "function" in data:
+        return data
+    inner = data.get("data")
+    if isinstance(inner, str):
+        try:
+            inner = json.loads(inner)
+        except Exception:  # noqa: BLE001
+            return {}
+    return inner if isinstance(inner, dict) else {}
+
+
+def _handle_invoke(bridge, packet: dict) -> None:
+    """Run one tool invocation and signal the result back to the caller.
+
+    Runs on a worker thread — never on the bridge reader thread — because the
+    reply is a host call whose response is read by that same reader thread; doing
+    it inline would deadlock.
+    """
+    tool_id = packet.get("tool_id") or TOOL_ID or "unknown"
+    function = packet.get("function", "invoke")
+    payload = packet.get("payload") or {}
+    print(f"TOOL_BOOT {json.dumps({'tool_id': tool_id, 'function': function, 'ts': time.time()})}", flush=True)
+    try:
+        result = _dispatch(tool_id, function, payload)
+    except Exception:
+        result = {"ok": False, "error": traceback.format_exc().splitlines()[-1]}
+    response = {"tool_id": tool_id, "function": function, "result": result}
+    print("TOOL_RESPONSE " + json.dumps(response, default=str), flush=True)
+    reply_to = packet.get("reply_to") or payload.get("reply_to")
+    correlation_id = packet.get("correlationId") or payload.get("correlationId")
+    if bridge is not None and reply_to:
+        try:
+            bridge.signal_user(
+                "creatures/signal", str(reply_to),
+                {"kind": "tools/result", "correlationId": correlation_id, "result": response})
+        except Exception as exc:  # noqa: BLE001
+            print(f"TOOL_BRIDGE {json.dumps({'reply_error': repr(exc)[:160]})}", flush=True)
+
+
+def _serve(bridge) -> int:
+    """Run the tool as a long-lived standalone creature.
+
+    The tool VM is started once (via ``runEntity``) and then stays alive,
+    receiving work purely as pushed signals over the docker-host gateway and
+    replying over the same channel. It never reads a task file and is never
+    cold-spawned per call — Davinci and other creatures reach it through the
+    Caspar signaling API.
+    """
+    import threading
+
+    tool_id = TOOL_ID or "unknown"
+    state = {"last": time.time(), "served": 0}
+    idle_timeout = float(os.environ.get("TOOL_SERVE_IDLE", "600"))
+
+    def on_signal(key: str, data) -> None:
+        if key != "creatures/signal":
+            return
+        packet = _extract_invoke(data if isinstance(data, dict) else {})
+        # Ignore our own result echoes and anything that isn't an invocation.
+        if not packet or packet.get("kind") == "tools/result":
+            return
+        if not (packet.get("tool_id") or packet.get("function") or packet.get("payload")):
+            return
+        state["last"] = time.time()
+        state["served"] += 1
+        threading.Thread(target=_handle_invoke, args=(bridge, packet), daemon=True).start()
+
+    bridge.on_signal(on_signal)
+    print("TOOL_SERVE_READY " + json.dumps(
+        {"tool_id": tool_id, "machine_id": getattr(bridge, "machine_id", ""),
+         "program_id": getattr(bridge, "program_id", ""), "ts": time.time()}), flush=True)
+
+    # Stay alive serving signals until the node terminates the VM (its
+    # max_exec_seconds) or no work has arrived for the idle window.
+    while time.time() - state["last"] < idle_timeout:
+        time.sleep(2)
+    print("TOOL_SERVE_EXIT " + json.dumps({"tool_id": tool_id, "served": state["served"]}), flush=True)
+    try:
+        bridge.close()
+    except Exception:  # noqa: BLE001
+        pass
+    return 0
+
+
+def _run_once_offline() -> int:
+    """One-shot fallback for offline/local execution with no gateway (unit tests):
+    read a task file if present, dispatch once, print the response."""
     signal = _read_signal()
     tool_id = signal.get("tool_id") or TOOL_ID or "unknown"
     function = signal.get("function", "invoke")
@@ -221,13 +315,19 @@ def main() -> int:
         result = {"ok": False, "error": traceback.format_exc().splitlines()[-1]}
     response = {"tool_id": tool_id, "function": function, "result": result}
     print("TOOL_RESPONSE " + json.dumps(response, default=str), flush=True)
-    _reply_over_bridge(signal, response)
-    if bridge is not None:
-        try:
-            bridge.close()
-        except Exception:  # noqa: BLE001
-            pass
     return 0
+
+
+def main() -> int:
+    # The single gateway connection is the tool's only channel to the outside
+    # world. When present, the tool runs as a long-lived standalone creature that
+    # is driven purely through the signaling API. With no gateway (local/unit
+    # tests) it falls back to a single offline dispatch.
+    bridge = _connect_bridge()
+    if bridge is not None:
+        print(f"TOOL_BRIDGE {json.dumps({'connected': True, 'session': bridge.session_id})}", flush=True)
+        return _serve(bridge)
+    return _run_once_offline()
 
 
 if __name__ == "__main__":

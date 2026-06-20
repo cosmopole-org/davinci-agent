@@ -213,15 +213,36 @@ def invoke(function_name: str, payload: dict) -> dict:
             page = context.new_page()
 
             for step in steps:
+                resolved = _resolve_action(step)
                 try:
                     results.append(_run_step(page, step, default_timeout))
                 except Exception as exc:
                     ok_all = False
                     results.append({"action": step.get("action"), "ok": False, "error": str(exc)})
+                    # A failed ``wait_for_selector`` (e.g. the caller guessed a
+                    # selector that this dynamic site doesn't use) must not abort
+                    # the whole run: the later extraction steps — and the rendered
+                    # body text attached below — still yield usable content.
+                    soft = resolved in ("wait_for_selector", "wait_for_load_state",
+                                        "wait_for_timeout")
+                    if soft:
+                        continue
                     if not step.get("continue_on_error", payload.get("continue_on_error", False)):
                         break
 
+            # Always return the rendered page text + a content excerpt so the
+            # caller receives the actual (post-JS) content even when its own
+            # selector-based extraction steps missed. This is what lets an agent
+            # parse dynamically-loaded posts it couldn't target by selector.
             final = {"url": page.url, "title": page.title()}
+            try:
+                final["text"] = (page.evaluate("document.body.innerText") or "")[:40_000]
+            except Exception:
+                pass
+            try:
+                final["content_excerpt"] = page.content()[:40_000]
+            except Exception:
+                pass
             context.close()
             browser.close()
     except Exception as exc:

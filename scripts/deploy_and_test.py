@@ -56,6 +56,43 @@ ADMIN_USER = "davinci_admin"
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 GEMINI_MODELS = [m.strip() for m in os.environ.get("GEMINI_MODELS", "").split(",") if m.strip()]
 
+# Provider-neutral LLM selection: the agent's reasoning is cross-LLM, so the
+# harness lets you pick the backbone via env without code changes. LLM_PROVIDER
+# (gemini|anthropic|openai|grok) + the matching <PROVIDER>_API_KEY / _MODELS.
+# Defaults to Gemini so existing runs are unchanged.
+LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "").strip().lower()
+_PROVIDER_ENVS = {
+    "gemini":    ("GEMINI_API_KEY", "GEMINI_MODELS"),
+    "anthropic": ("ANTHROPIC_API_KEY", "ANTHROPIC_MODELS"),
+    "openai":    ("OPENAI_API_KEY", "OPENAI_MODELS"),
+    "grok":      ("GROK_API_KEY", "GROK_MODELS"),
+}
+
+
+def llm_config() -> dict:
+    """Build the LLM portion of the davinci creature config from the environment.
+
+    Always carries any ``GEMINI_*`` values (backward compatible), and — when
+    ``LLM_PROVIDER`` names a different provider with a key set — adds the generic
+    ``llm_provider`` + ``<provider>_api_key`` / ``<provider>_models`` keys the
+    creature's ``reasoner_from_config`` understands. Keys are read from the
+    environment of *this* harness only; never written to disk or committed.
+    """
+    cfg: dict = {}
+    if GEMINI_API_KEY:
+        cfg["gemini_api_key"] = GEMINI_API_KEY
+        cfg["gemini_models"] = GEMINI_MODELS or None
+    if LLM_PROVIDER in _PROVIDER_ENVS:
+        key_env, models_env = _PROVIDER_ENVS[LLM_PROVIDER]
+        key = os.environ.get(key_env, "").strip()
+        if key:
+            cfg["llm_provider"] = LLM_PROVIDER
+            cfg[f"{LLM_PROVIDER}_api_key"] = key
+            models = [m.strip() for m in os.environ.get(models_env, "").split(",") if m.strip()]
+            if models:
+                cfg[f"{LLM_PROVIDER}_models"] = models
+    return cfg
+
 # In hardened environments outbound HTTPS is intercepted by an egress gateway
 # whose CA must be trusted inside the creature containers (otherwise Gemini /
 # web tools fail TLS verification). We ship the host CA bundle into each image.
@@ -310,10 +347,9 @@ def signal_davinci(c: CasparSignalingClient, davinci: dict, tool_recs: list) -> 
             "required_categories": [t["category"] for t in tool_recs]}
     config = {"node_host": NODE_HOST_FROM_VM, "node_port": NODE_PORT,
               "username": ADMIN_USER,
-              # LLM backbone for the agent's reasoning (Gemini). Key comes from
-              # the environment of *this* harness only — never committed.
-              "gemini_api_key": GEMINI_API_KEY,
-              "gemini_models": GEMINI_MODELS or None,
+              # LLM backbone for the agent's reasoning (provider-neutral). Keys
+              # come from the environment of *this* harness only — never committed.
+              **llm_config(),
               "tools": [{"name": t["name"], "tool_id": t["tool_id"], "category": t["category"],
                          "risk": t["risk"], "description": t["description"],
                          "program_id": t["program_id"], "entity_id": t["entity_id"],

@@ -98,8 +98,7 @@ def _gemini_config(tool_recs: list, store_cfg: dict = None) -> dict:
     cfg = {
         "node_host": dt.NODE_HOST_FROM_VM, "node_port": dt.NODE_PORT,
         "username": dt.ADMIN_USER,
-        "gemini_api_key": dt.GEMINI_API_KEY,
-        "gemini_models": dt.GEMINI_MODELS or None,
+        **dt.llm_config(),
     }
     if store_cfg:
         # Path A: Davinci discovers tools by listing the store's MCP machines.

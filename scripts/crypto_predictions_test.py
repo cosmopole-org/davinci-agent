@@ -181,8 +181,8 @@ def signal_davinci_task(c: CasparSignalingClient, davinci: dict, tool_recs: list
     config = {
         "node_host": dt.NODE_HOST_FROM_VM, "node_port": dt.NODE_PORT,
         "username": dt.ADMIN_USER,
-        "gemini_api_key": dt.GEMINI_API_KEY,
-        "gemini_models": dt.GEMINI_MODELS or None,
+        # Provider-neutral LLM backbone (Gemini/Anthropic/OpenAI/Grok via env).
+        **dt.llm_config(),
         "tools": [
             {"name": t["name"], "tool_id": t["tool_id"], "category": t["category"],
              "risk": t["risk"], "description": t["description"],
@@ -204,8 +204,8 @@ def signal_davinci_task(c: CasparSignalingClient, davinci: dict, tool_recs: list
 
 
 def main() -> int:
-    if not dt.GEMINI_API_KEY:
-        bad("GEMINI_API_KEY not set — exiting (Gemini is the LLM backbone)")
+    if not dt.llm_config().get("gemini_api_key") and not dt.llm_config().get("llm_provider"):
+        bad("no LLM key set — set GEMINI_API_KEY (or LLM_PROVIDER + <PROVIDER>_API_KEY)")
         return 2
 
     tools = [t for t in dt.TOOLS if t["tool_id"] in TOOL_IDS]

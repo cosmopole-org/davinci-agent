@@ -141,8 +141,9 @@ End-to-end:
 3. The creature decodes each inline attachment and **writes it to its
    filesystem** at `/app/input/attachments/<name>` (where the agent and any
    delegated tool creature can read it as a real file).
-4. The `GeminiReasoner` sends the prompt with each attachment as a standard
-   Gemini multimodal `parts[]` entry — inline (`inlineData`) for files
+4. The active LLM client sends the prompt with each attachment as a standard
+   multimodal part. The `GeminiClient`, for example, uses a Gemini `parts[]`
+   entry — inline (`inlineData`) for files
    ≤ 18 MiB, or uploaded via the **Gemini Files API** (`fileData`/`fileUri`)
    for larger files. This matches Google's official multimodal contract.
 
@@ -213,7 +214,6 @@ davinci/                 # the agent runtime package
   mcp.py                 # MCP-style tool registry
   reasoner.py            # provider-agnostic LLMReasoner (shared reasoning logic)
   llm.py                 # cross-LLM clients: Gemini · Anthropic · OpenAI · Grok
-  gemini_reasoner.py     # thin back-compat shim over reasoner.py + llm.py
   caspar_signaling.py    # Caspar TCP client (RSA-PSS signing)
   caspar_runtime.py      # docker-creature entrypoint (live signalling)
   caspar_executor.py     # signal pre-running Caspar tool VMs

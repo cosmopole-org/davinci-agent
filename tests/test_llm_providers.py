@@ -180,16 +180,3 @@ def test_synthesize_uses_tool_results_and_obeys_format():
     plan = Plan(objective="o")
     plan.add_step("synth", "synthesis", "r")
     assert reasoner.synthesize("o", plan, mem) == "42"
-
-
-# --------------------------------------------------------------------------- #
-# Backward compatibility
-# --------------------------------------------------------------------------- #
-
-def test_gemini_reasoner_back_compat_shim():
-    from davinci.gemini_reasoner import GeminiReasoner, reasoner_from_config as rfc
-    r = GeminiReasoner("fake-key")
-    assert isinstance(r, LLMReasoner)
-    assert r.provider == "gemini"
-    assert r.models == GeminiClient.DEFAULT_MODELS
-    assert rfc is reasoner_from_config

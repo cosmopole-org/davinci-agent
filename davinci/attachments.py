@@ -31,7 +31,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
 # Gemini's inline-bytes limit is 20 MiB per part; above this we fall back to
-# the Files API (see :func:`davinci.gemini_reasoner`). Keep this conservative.
+# the Files API (see :class:`davinci.llm.GeminiClient`). Keep this conservative.
 INLINE_MAX_BYTES = 18 * 1024 * 1024
 
 # Names a creature is allowed to write under its attachments dir. Reject

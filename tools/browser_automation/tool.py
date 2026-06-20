@@ -36,13 +36,51 @@ from __future__ import annotations
 
 import base64
 import json
+import os
+
+
+# Map the natural action names LLMs commonly emit onto the canonical Playwright
+# step verbs this tool implements, so a model that asks to "navigate" or "wait"
+# (instead of "goto" / "wait_for_*") still drives the browser successfully.
+_ACTION_ALIASES = {
+    "navigate": "goto", "open": "goto", "open_url": "goto", "visit": "goto",
+    "load": "goto", "go": "goto", "goto_url": "goto",
+    "sleep": "wait_for_timeout", "delay": "wait_for_timeout", "pause": "wait_for_timeout",
+    "wait_for": "wait_for_selector", "wait_for_element": "wait_for_selector",
+    "wait_for_navigation": "wait_for_load_state", "wait_for_network": "wait_for_load_state",
+    "get_text": "text", "extract_text": "text", "read_text": "text", "inner_text": "text",
+    "extract": "content", "get_content": "content", "get_html": "content", "html": "content",
+    "page_content": "content", "source": "content",
+    "scroll_down": "scroll", "scroll_to_bottom": "scroll", "scroll_to": "scroll",
+    "eval": "evaluate", "execute_script": "evaluate", "run_script": "evaluate",
+    "snap": "screenshot", "capture": "screenshot", "shot": "screenshot",
+    "back": "go_back", "attribute": "get_attribute", "attr": "get_attribute",
+}
+
+
+def _resolve_action(step: dict) -> str:
+    action = (step.get("action") or step.get("op") or "").lower().strip()
+    # ``wait`` is ambiguous: pick the concrete verb from the step's own fields.
+    if action == "wait":
+        if step.get("selector"):
+            return "wait_for_selector"
+        if any(k in step for k in ("ms", "timeout", "seconds", "duration")):
+            return "wait_for_timeout"
+        return "wait_for_load_state"
+    return _ACTION_ALIASES.get(action, action)
 
 
 def _run_step(page, step: dict, default_timeout: int) -> dict:
-    action = (step.get("action") or step.get("op") or "").lower()
+    action = _resolve_action(step)
     sel = step.get("selector")
     timeout = int(step.get("timeout_ms", default_timeout))
     out = {"action": action}
+
+    if action == "wait_for_timeout" and "ms" not in step:
+        # Honour seconds/duration aliases when an LLM expresses the pause that way.
+        secs = step.get("seconds", step.get("duration"))
+        if secs is not None:
+            step = {**step, "ms": int(float(secs) * 1000)}
 
     if action == "goto":
         resp = page.goto(step["url"], timeout=timeout,
@@ -143,33 +181,67 @@ def invoke(function_name: str, payload: dict) -> dict:
     results = []
     ok_all = True
 
+    # Tool creatures reach the network through a TLS-intercepting egress gateway
+    # whose CA is baked into the image as a file bundle (honoured by requests via
+    # REQUESTS_CA_BUNDLE). Chromium, however, uses its own trust store and will
+    # not pick that bundle up, so it would otherwise fail every HTTPS navigation
+    # with net::ERR_CERT_AUTHORITY_INVALID. Default to ignoring cert errors here
+    # (overridable per-call or via env) so the browser can load real sites.
+    ignore_tls = payload.get("ignore_https_errors")
+    if ignore_tls is None:
+        ignore_tls = os.environ.get(
+            "BROWSER_IGNORE_HTTPS_ERRORS", "1").strip().lower() not in ("0", "false", "no", "")
+
     try:
         with sync_playwright() as pw:
             launcher = getattr(pw, browser_name)
+            chromium_args = ["--no-sandbox", "--disable-dev-shm-usage"]
+            if ignore_tls:
+                chromium_args.append("--ignore-certificate-errors")
             browser = launcher.launch(headless=headless,
-                                      args=["--no-sandbox", "--disable-dev-shm-usage"]
+                                      args=chromium_args
                                       if browser_name == "chromium" else None)
             ctx_kwargs = {}
             if payload.get("viewport"):
                 ctx_kwargs["viewport"] = payload["viewport"]
             if payload.get("user_agent"):
                 ctx_kwargs["user_agent"] = payload["user_agent"]
-            if payload.get("ignore_https_errors"):
+            if ignore_tls:
                 ctx_kwargs["ignore_https_errors"] = True
             context = browser.new_context(**ctx_kwargs)
             context.set_default_timeout(default_timeout)
             page = context.new_page()
 
             for step in steps:
+                resolved = _resolve_action(step)
                 try:
                     results.append(_run_step(page, step, default_timeout))
                 except Exception as exc:
                     ok_all = False
                     results.append({"action": step.get("action"), "ok": False, "error": str(exc)})
+                    # A failed ``wait_for_selector`` (e.g. the caller guessed a
+                    # selector that this dynamic site doesn't use) must not abort
+                    # the whole run: the later extraction steps — and the rendered
+                    # body text attached below — still yield usable content.
+                    soft = resolved in ("wait_for_selector", "wait_for_load_state",
+                                        "wait_for_timeout")
+                    if soft:
+                        continue
                     if not step.get("continue_on_error", payload.get("continue_on_error", False)):
                         break
 
+            # Always return the rendered page TEXT (post-JS innerText) so the
+            # caller receives the actual dynamically-loaded content even when its
+            # own selector-based extraction steps missed. We deliberately do NOT
+            # return the raw HTML here: the first tens-of-KB of a single-page
+            # app's HTML is just <head>/script boilerplate with none of the
+            # visible content, which both bloats the result and misleads callers
+            # into thinking extraction failed. innerText carries the real posts.
             final = {"url": page.url, "title": page.title()}
+            try:
+                final["text"] = (page.evaluate("document.body.innerText") or "")[:40_000]
+            except Exception:
+                pass
             context.close()
             browser.close()
     except Exception as exc:

@@ -278,7 +278,12 @@ class LLMReasoner:
 
     @staticmethod
     def _memory_digest(memory: WorkingMemory, *, roles: tuple = (),
-                       limit: int = 8, cap: int = 1500) -> List[Dict[str, str]]:
+                       limit: int = 8, cap: int = 1500,
+                       tool_cap: int = 24000) -> List[Dict[str, str]]:
+        # Tool results carry the actual gathered data (e.g. a scraped page's
+        # rendered text); a tight cap would hide that payload from the model and
+        # force it to act on the header/nav only. Give tool_result entries a much
+        # larger budget than chat turns so the next step reasons over real data.
         items = getattr(memory, "items", []) or []
         out: List[Dict[str, str]] = []
         for entry in items[-limit:]:
@@ -287,12 +292,13 @@ class LLMReasoner:
                 continue
             content = entry.get("content")
             text = content if isinstance(content, str) else json.dumps(content, default=str)
-            out.append({"role": role, "content": text[:cap]})
+            limit_chars = tool_cap if role == "tool_result" else cap
+            out.append({"role": role, "content": text[:limit_chars]})
         return out
 
     @staticmethod
     def _tool_results_full(memory: WorkingMemory, *, limit: int = 16,
-                           cap: int = 6000) -> List[Any]:
+                           cap: int = 24000) -> List[Any]:
         items = getattr(memory, "items", []) or []
         out: List[Any] = []
         for entry in items:

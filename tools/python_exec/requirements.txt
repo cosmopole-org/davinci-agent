@@ -1,3 +1,9 @@
 # Scientific stack available to executed code.
 numpy>=1.26
 pandas>=2.1
+# HTTP + HTML parsing so executed code can fetch pages and crypto-price APIs and
+# parse results without a (sandbox-blocked) runtime pip install. JS-heavy page
+# rendering is delegated to the dedicated browser_automation tool creature.
+requests>=2.31
+beautifulsoup4>=4.12
+lxml>=5.0

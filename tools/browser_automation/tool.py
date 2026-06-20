@@ -230,17 +230,16 @@ def invoke(function_name: str, payload: dict) -> dict:
                     if not step.get("continue_on_error", payload.get("continue_on_error", False)):
                         break
 
-            # Always return the rendered page text + a content excerpt so the
-            # caller receives the actual (post-JS) content even when its own
-            # selector-based extraction steps missed. This is what lets an agent
-            # parse dynamically-loaded posts it couldn't target by selector.
+            # Always return the rendered page TEXT (post-JS innerText) so the
+            # caller receives the actual dynamically-loaded content even when its
+            # own selector-based extraction steps missed. We deliberately do NOT
+            # return the raw HTML here: the first tens-of-KB of a single-page
+            # app's HTML is just <head>/script boilerplate with none of the
+            # visible content, which both bloats the result and misleads callers
+            # into thinking extraction failed. innerText carries the real posts.
             final = {"url": page.url, "title": page.title()}
             try:
                 final["text"] = (page.evaluate("document.body.innerText") or "")[:40_000]
-            except Exception:
-                pass
-            try:
-                final["content_excerpt"] = page.content()[:40_000]
             except Exception:
                 pass
             context.close()

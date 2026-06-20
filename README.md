@@ -37,6 +37,7 @@ Implemented in the `davinci/` package (stdlib-only, runs in a slim container):
 | Area | Capability | Module |
 |------|-----------|--------|
 | Reasoning | plan-and-execute · ReAct · reflection · replan-on-failure · stuck/loop detection | `engine.py`, `planning.py` |
+| LLM backbone | **provider-agnostic** reasoning/planning/loop · pluggable clients (Gemini · Anthropic/Claude · OpenAI · Grok · any OpenAI-compatible) · multi-model fallback | `reasoner.py`, `llm.py` |
 | Permissions | risk tiers (low/med/high) · 6 permission modes · deny-first rules · input **and** output guardrails | `permissions.py` |
 | Limits | bounded execution (steps/tool-calls) · token + cost budget · wall-clock deadline | `observability.py` |
 | Memory | working memory · event-sourced JSONL episodic log (replay/resume) · hierarchical `DAVINCI.md` instructions · context compaction | `memory.py` |
@@ -59,7 +60,12 @@ python3 -m pytest -q                         # 26 tests
 
 Davinci's tools are deployed as **separate Caspar `docker` creatures**, and the
 Davinci creature interacts with them purely through the Caspar **signalling API**.
-The agent's reasoning is driven by a **Gemini** LLM backbone.
+The agent's reasoning is driven by a **pluggable LLM backbone** — the same
+reasoning/planning/loop algorithms run on **Gemini**, **Anthropic (Claude)**,
+**OpenAI**, **Grok (xAI)**, or any OpenAI-compatible endpoint. Pick the provider
+in the task config (`llm_provider` / `<provider>_api_key`, or an `llm` block);
+Gemini is the default when only a Gemini key is supplied. The examples below pass
+a Gemini key, but any provider's key works the same way.
 
 ### One-command end-to-end workflow (recommended)
 
@@ -135,8 +141,9 @@ End-to-end:
 3. The creature decodes each inline attachment and **writes it to its
    filesystem** at `/app/input/attachments/<name>` (where the agent and any
    delegated tool creature can read it as a real file).
-4. The `GeminiReasoner` sends the prompt with each attachment as a standard
-   Gemini multimodal `parts[]` entry — inline (`inlineData`) for files
+4. The active LLM client sends the prompt with each attachment as a standard
+   multimodal part. The `GeminiClient`, for example, uses a Gemini `parts[]`
+   entry — inline (`inlineData`) for files
    ≤ 18 MiB, or uploaded via the **Gemini Files API** (`fileData`/`fileUri`)
    for larger files. This matches Google's official multimodal contract.
 
@@ -205,6 +212,8 @@ davinci/                 # the agent runtime package
   memory.py              # working / episodic / instruction memory
   observability.py       # tracer, budget, secret masking
   mcp.py                 # MCP-style tool registry
+  reasoner.py            # provider-agnostic LLMReasoner (shared reasoning logic)
+  llm.py                 # cross-LLM clients: Gemini · Anthropic · OpenAI · Grok
   caspar_signaling.py    # Caspar TCP client (RSA-PSS signing)
   caspar_runtime.py      # docker-creature entrypoint (live signalling)
   caspar_executor.py     # signal pre-running Caspar tool VMs

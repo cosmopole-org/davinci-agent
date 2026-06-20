@@ -16,7 +16,7 @@ from davinci import (  # noqa: E402
     Attachment, DavinciAgent, INLINE_MAX_BYTES,
     attachment_from_file, materialize_attachments,
 )
-from davinci.gemini_reasoner import GeminiReasoner  # noqa: E402
+from davinci.llm import GeminiClient  # noqa: E402
 
 
 PNG_1x1 = (b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
@@ -125,24 +125,24 @@ def test_run_passes_attachments_to_working_memory():
     assert starts and starts[0].data["attachments"][0]["name"] == "x.png"
 
 
-def test_gemini_reasoner_inlines_small_attachments():
-    reasoner = GeminiReasoner("fake-key")
+def test_gemini_client_inlines_small_attachments():
+    client = GeminiClient("fake-key")
     with tempfile.TemporaryDirectory() as tmp:
         path = os.path.join(tmp, "tiny.png")
         with open(path, "wb") as fh:
             fh.write(PNG_1x1)
         att = Attachment(name="tiny.png", mime_type="image/png",
                          path=path, size=len(PNG_1x1))
-        part = reasoner._attachment_part(att)
+        part = client._attachment_part(att)
     assert part is not None
     assert "inlineData" in part
     assert part["inlineData"]["mimeType"] == "image/png"
     assert base64.b64decode(part["inlineData"]["data"]) == PNG_1x1
 
 
-def test_gemini_reasoner_generate_packs_attachments_into_parts():
+def test_gemini_client_generate_packs_attachments_into_parts():
     """Real LLM not called — we mock urlopen and assert the body shape."""
-    reasoner = GeminiReasoner("fake-key", max_retries=1, timeout=2)
+    client = GeminiClient("fake-key", max_retries=1, timeout=2)
     with tempfile.TemporaryDirectory() as tmp:
         path = os.path.join(tmp, "tiny.png")
         with open(path, "wb") as fh:
@@ -172,8 +172,8 @@ def test_gemini_reasoner_generate_packs_attachments_into_parts():
             return _FakeResp(payload)
 
         with patch("urllib.request.urlopen", side_effect=_fake_urlopen):
-            text = reasoner._generate("describe the image",
-                                       attachments=[att])
+            text = client.generate("describe the image",
+                                    attachments=[att])
         assert text is not None
         sent = json.loads(captured["body"])
         parts = sent["contents"][0]["parts"]

@@ -24,9 +24,20 @@ from .engine import (
     ToolExecutor,
     ToolResult,
 )
+from .llm import (
+    AnthropicClient,
+    GeminiClient,
+    GrokClient,
+    LLMClient,
+    OpenAIClient,
+    OpenAICompatibleClient,
+    client_from_config,
+    make_client,
+)
 from .mcp import ToolDescriptor, ToolRegistry
 from .memory import EpisodicMemory, InstructionMemory, WorkingMemory, compact_messages
 from .observability import Budget, Tracer, mask_secrets
+from .reasoner import LLMReasoner, reasoner_from_config
 from .permissions import Decision, Outcome, PermissionEngine, PermissionMode, Risk, ToolAction
 from .planning import Plan, Planner, PlanStep, StepStatus
 
@@ -41,5 +52,8 @@ __all__ = [
     "PermissionEngine", "PermissionMode", "Risk", "Outcome", "Decision", "ToolAction",
     "Plan", "Planner", "PlanStep", "StepStatus",
     "Attachment", "attachment_from_file", "materialize_attachments", "INLINE_MAX_BYTES",
+    "LLMReasoner", "reasoner_from_config",
+    "LLMClient", "GeminiClient", "AnthropicClient", "OpenAIClient",
+    "OpenAICompatibleClient", "GrokClient", "make_client", "client_from_config",
     "__version__",
 ]

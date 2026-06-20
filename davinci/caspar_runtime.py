@@ -334,15 +334,17 @@ def _run_agent(bridge: Any, task: Dict[str, Any], config: Dict[str, Any],
         # Offline / local self-test: built-in capability set, no signalling.
         registry = _build_registry()
 
-    # LLM backbone: use Gemini as the reasoner when an API key is supplied via
-    # the task's config. Any failure leaves the deterministic HeuristicReasoner.
+    # LLM backbone: pick whichever provider the task config names (Gemini,
+    # Anthropic/Claude, OpenAI, Grok, …). The reasoning/planning/loop logic is
+    # shared across all of them; only the client differs. Any failure leaves the
+    # deterministic HeuristicReasoner in place.
     reasoner: Any = None
     llm_provider = "heuristic"
     try:
-        from .gemini_reasoner import reasoner_from_config
+        from .reasoner import reasoner_from_config
         reasoner = reasoner_from_config(config)
         if reasoner is not None:
-            llm_provider = "gemini:" + ",".join(reasoner.models)
+            llm_provider = f"{reasoner.provider}:" + ",".join(reasoner.models)
     except Exception as exc:  # noqa: BLE001 — never block boot on LLM wiring
         print("DAVINCI_BOOT " + json.dumps({"llm_init_error": repr(exc)[:160]}), flush=True)
 

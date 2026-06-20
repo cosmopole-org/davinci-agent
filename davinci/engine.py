@@ -166,7 +166,7 @@ class DavinciAgent:
             attachments: Optional[List[Attachment]] = None) -> RunResult:
         # Multimodal attachments accompanying the user prompt: surface them on
         # the working memory so reasoners that understand multimodal input
-        # (e.g. GeminiReasoner) can attach them to their LLM calls. The
+        # (e.g. LLMReasoner) can attach them to their LLM calls. The
         # deterministic HeuristicReasoner simply ignores them.
         atts = list(attachments or [])
         if atts:

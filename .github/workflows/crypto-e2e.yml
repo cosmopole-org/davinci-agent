@@ -1,0 +1,188 @@
+name: Crypto Predictions E2E Test
+
+on:
+  workflow_dispatch:
+    inputs:
+      agentrouter_api_key:
+        description: "AgentRouter API key (overrides secret)"
+        required: false
+        default: ""
+  push:
+    branches:
+      - claude/agentrouter-adapter-crypto-tests-dy84dt
+
+jobs:
+  crypto-e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    env:
+      LLM_PROVIDER: agentrouter
+      AGENTROUTER_API_KEY: ${{ inputs.agentrouter_api_key || secrets.AGENTROUTER_API_KEY }}
+      CASPAR_DOCKER_RUNTIME: runc
+      CASPAR_DOCKER_DISK_QUOTA: "0"
+      DATA_ROOT: /tmp/caspar
+
+    steps:
+      # ── Repos ────────────────────────────────────────────────────────────────
+      - name: Check out davinci-agent
+        uses: actions/checkout@v4
+        with:
+          path: davinci-agent
+
+      - name: Check out caspar
+        uses: actions/checkout@v4
+        with:
+          repository: cosmopole-org/caspar
+          path: caspar
+
+      # ── Python ───────────────────────────────────────────────────────────────
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          cd davinci-agent
+          pip install -e ".[dev]" 2>/dev/null || pip install -r requirements.txt 2>/dev/null || true
+          # Ensure anthropic SDK is present (AgentRouterClient uses it)
+          pip install anthropic requests 2>/dev/null || true
+
+      # ── Docker / kasper network ───────────────────────────────────────────────
+      - name: Create kasper Docker network
+        run: docker network create kasper || true
+
+      # ── QuestDB ──────────────────────────────────────────────────────────────
+      - name: Start QuestDB
+        run: |
+          QUESTDB_JAR="$GITHUB_WORKSPACE/caspar/dist/questdb/questdb.jar"
+          if [[ ! -f "$QUESTDB_JAR" ]]; then
+            echo "::warning::questdb.jar not found at $QUESTDB_JAR — skipping QuestDB"
+            exit 0
+          fi
+          mkdir -p "$DATA_ROOT/questdb"
+          nohup java -jar "$QUESTDB_JAR" start \
+            -d "$DATA_ROOT/questdb" \
+            > "$DATA_ROOT/questdb.log" 2>&1 &
+          echo "QuestDB PID=$!"
+          # Wait up to 30 s for the Postgres wire port (8812)
+          for i in $(seq 1 30); do
+            nc -z 127.0.0.1 8812 2>/dev/null && { echo "QuestDB ready"; break; }
+            sleep 1
+          done
+
+      # ── Caspar node ──────────────────────────────────────────────────────────
+      - name: Generate Caspar keypair for node1
+        run: |
+          mkdir -p "$DATA_ROOT/node1"
+          KEYGEN="$GITHUB_WORKSPACE/caspar/dist/bin/caspar-keygen"
+          if [[ -x "$KEYGEN" ]]; then
+            "$KEYGEN" --out-dir "$DATA_ROOT/node1" 2>/dev/null || true
+          fi
+
+      - name: Start Caspar node1
+        run: |
+          BINARY="$GITHUB_WORKSPACE/caspar/dist/bin/caspar-node"
+          if [[ ! -x "$BINARY" ]]; then
+            echo "::error::caspar-node binary not found at $BINARY"
+            exit 1
+          fi
+          mkdir -p "$DATA_ROOT/node1"
+          export CASPAR_DOCKER_RUNTIME=runc
+          export CASPAR_DOCKER_DISK_QUOTA=0
+          nohup "$BINARY" \
+            --data-dir "$DATA_ROOT/node1" \
+            --port 8074 \
+            --http-port 8080 \
+            > "$DATA_ROOT/node1/node.log" 2>&1 &
+          echo "caspar-node PID=$!"
+          # Wait up to 60 s for the signaling API
+          for i in $(seq 1 60); do
+            curl -sf http://127.0.0.1:8080/health 2>/dev/null && { echo "Caspar node ready"; break; }
+            sleep 1
+          done
+          echo "Caspar node startup complete (or timed out — test will surface the error)"
+
+      # ── Run the test ─────────────────────────────────────────────────────────
+      - name: Run crypto predictions test
+        id: crypto_test
+        continue-on-error: true
+        run: |
+          cd davinci-agent
+          set -o pipefail
+          python3 scripts/crypto_predictions_test.py 2>&1 | tee /tmp/crypto_test.log
+          echo "exit_code=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
+
+      # ── Collect and print all logs ────────────────────────────────────────────
+      - name: Print Caspar node log
+        if: always()
+        run: |
+          echo "════════════════════════════════════════════════════════════"
+          echo "  CASPAR NODE LOG  ($DATA_ROOT/node1/node.log)"
+          echo "════════════════════════════════════════════════════════════"
+          cat "$DATA_ROOT/node1/node.log" 2>/dev/null || echo "(no node log found)"
+
+      - name: Print QuestDB log
+        if: always()
+        run: |
+          echo "════════════════════════════════════════════════════════════"
+          echo "  QUESTDB LOG  ($DATA_ROOT/questdb.log)"
+          echo "════════════════════════════════════════════════════════════"
+          cat "$DATA_ROOT/questdb.log" 2>/dev/null || echo "(no questdb log)"
+
+      - name: Print Docker container logs
+        if: always()
+        run: |
+          echo "════════════════════════════════════════════════════════════"
+          echo "  DOCKER CONTAINERS"
+          echo "════════════════════════════════════════════════════════════"
+          docker ps -a --format "table {{.Names}}\t{{.Status}}\t{{.Image}}" || true
+          echo ""
+
+          # Print logs for every container (tool VMs follow *_global_* naming)
+          for cid in $(docker ps -aq 2>/dev/null); do
+            name=$(docker inspect --format '{{.Name}}' "$cid" 2>/dev/null | tr -d '/')
+            echo "────────────────────────────────────────────────────────"
+            echo "  Container: $name  ($cid)"
+            echo "────────────────────────────────────────────────────────"
+            docker logs --timestamps "$cid" 2>&1 || true
+            echo ""
+          done
+
+      - name: Print crypto test output
+        if: always()
+        run: |
+          echo "════════════════════════════════════════════════════════════"
+          echo "  CRYPTO TEST STDOUT/STDERR  (/tmp/crypto_test.log)"
+          echo "════════════════════════════════════════════════════════════"
+          cat /tmp/crypto_test.log 2>/dev/null || echo "(no test log)"
+
+      # ── Upload logs as artifact ───────────────────────────────────────────────
+      - name: Upload logs as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: crypto-e2e-logs-${{ github.run_id }}
+          retention-days: 7
+          path: |
+            /tmp/crypto_test.log
+            /tmp/caspar/node1/node.log
+            /tmp/caspar/questdb.log
+
+      # ── Final status ─────────────────────────────────────────────────────────
+      - name: Report result
+        if: always()
+        run: |
+          echo "════════════════════════════════════════════════════════════"
+          if grep -q "OVERALL.*PASS" /tmp/crypto_test.log 2>/dev/null; then
+            echo "  RESULT: PASS"
+          elif grep -q "OVERALL.*FAIL" /tmp/crypto_test.log 2>/dev/null; then
+            echo "  RESULT: FAIL"
+            exit 1
+          else
+            echo "  RESULT: UNKNOWN (check logs above)"
+            exit 1
+          fi
+          echo "════════════════════════════════════════════════════════════"

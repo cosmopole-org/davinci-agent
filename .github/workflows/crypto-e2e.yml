@@ -36,7 +36,13 @@ jobs:
           repository: cosmopole-org/caspar
           path: caspar
 
-      # ── Python ───────────────────────────────────────────────────────────────
+      # ── Toolchains ───────────────────────────────────────────────────────────
+      - name: Set up Java 17 (required by QuestDB)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
@@ -50,60 +56,31 @@ jobs:
           # Ensure anthropic SDK is present (AgentRouterClient uses it)
           pip install anthropic requests 2>/dev/null || true
 
-      # ── Docker / kasper network ───────────────────────────────────────────────
-      - name: Create kasper Docker network
-        run: docker network create kasper || true
-
-      # ── QuestDB ──────────────────────────────────────────────────────────────
-      - name: Start QuestDB
-        run: |
-          QUESTDB_JAR="$GITHUB_WORKSPACE/caspar/dist/questdb/questdb.jar"
-          if [[ ! -f "$QUESTDB_JAR" ]]; then
-            echo "::warning::questdb.jar not found at $QUESTDB_JAR — skipping QuestDB"
-            exit 0
-          fi
-          mkdir -p "$DATA_ROOT/questdb"
-          nohup java -jar "$QUESTDB_JAR" start \
-            -d "$DATA_ROOT/questdb" \
-            > "$DATA_ROOT/questdb.log" 2>&1 &
-          echo "QuestDB PID=$!"
-          # Wait up to 30 s for the Postgres wire port (8812)
-          for i in $(seq 1 30); do
-            nc -z 127.0.0.1 8812 2>/dev/null && { echo "QuestDB ready"; break; }
-            sleep 1
-          done
-
       # ── Caspar node ──────────────────────────────────────────────────────────
-      - name: Generate Caspar keypair for node1
+      # run-nodes.sh owns the full node bring-up: it creates the `kasper` Docker
+      # bridge network, starts a per-node QuestDB, generates node config + babble
+      # keys + peers.genesis.json, launches the node, and blocks until the
+      # signaling port (8074) accepts connections before returning. We drive it
+      # with the appropriate flags for CI:
+      #   single          — only node1 (no triple-node consensus cluster)
+      #   --no-docker     — run the node as the pre-built dist binary on the host
+      #                     (the node still launches docker tool creatures itself)
+      #   --no-gvisor     — no runsc sandbox in CI; this auto-exports
+      #                     CASPAR_DOCKER_RUNTIME=runc + CASPAR_DOCKER_DISK_QUOTA=0
+      #   --no-firecracker— no microVM host networking in CI
+      #   --no-rebuild    — use dist/ binaries as-is (no cargo build)
+      #   --skip-deploy   — the crypto test deploys its own creatures via the
+      #                     signaling API, so skip the WASM clone/build step
+      - name: Start Caspar node via run-nodes.sh
+        working-directory: caspar
         run: |
-          mkdir -p "$DATA_ROOT/node1"
-          KEYGEN="$GITHUB_WORKSPACE/caspar/dist/bin/caspar-keygen"
-          if [[ -x "$KEYGEN" ]]; then
-            "$KEYGEN" --out-dir "$DATA_ROOT/node1" 2>/dev/null || true
-          fi
-
-      - name: Start Caspar node1
-        run: |
-          BINARY="$GITHUB_WORKSPACE/caspar/dist/bin/caspar-node"
-          if [[ ! -x "$BINARY" ]]; then
-            echo "::error::caspar-node binary not found at $BINARY"
-            exit 1
-          fi
-          mkdir -p "$DATA_ROOT/node1"
-          export CASPAR_DOCKER_RUNTIME=runc
-          export CASPAR_DOCKER_DISK_QUOTA=0
-          nohup "$BINARY" \
-            --data-dir "$DATA_ROOT/node1" \
-            --port 8074 \
-            --http-port 8080 \
-            > "$DATA_ROOT/node1/node.log" 2>&1 &
-          echo "caspar-node PID=$!"
-          # Wait up to 60 s for the signaling API
-          for i in $(seq 1 60); do
-            curl -sf http://127.0.0.1:8080/health 2>/dev/null && { echo "Caspar node ready"; break; }
-            sleep 1
-          done
-          echo "Caspar node startup complete (or timed out — test will surface the error)"
+          chmod +x ./run-nodes.sh ./stop-nodes.sh 2>/dev/null || true
+          ./run-nodes.sh single \
+            --no-docker \
+            --no-gvisor \
+            --no-firecracker \
+            --no-rebuild \
+            --skip-deploy
 
       # ── Run the test ─────────────────────────────────────────────────────────
       - name: Run crypto predictions test
@@ -128,9 +105,9 @@ jobs:
         if: always()
         run: |
           echo "════════════════════════════════════════════════════════════"
-          echo "  QUESTDB LOG  ($DATA_ROOT/questdb.log)"
+          echo "  QUESTDB LOG  ($DATA_ROOT/node1/questdb.log)"
           echo "════════════════════════════════════════════════════════════"
-          cat "$DATA_ROOT/questdb.log" 2>/dev/null || echo "(no questdb log)"
+          cat "$DATA_ROOT/node1/questdb.log" 2>/dev/null || echo "(no questdb log)"
 
       - name: Print Docker container logs
         if: always()
@@ -169,7 +146,7 @@ jobs:
           path: |
             /tmp/crypto_test.log
             /tmp/caspar/node1/node.log
-            /tmp/caspar/questdb.log
+            /tmp/caspar/node1/questdb.log
 
       # ── Final status ─────────────────────────────────────────────────────────
       - name: Report result

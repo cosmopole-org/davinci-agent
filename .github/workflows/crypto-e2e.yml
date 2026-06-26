@@ -60,6 +60,33 @@ jobs:
           #                  (davinci/caspar_signaling.py imports Crypto.*)
           pip install anthropic requests pycryptodome
 
+      # ── Docker daemon — register runsc alias ─────────────────────────────────
+      # The pre-built dist/bin/caspar-node has the runsc runtime hardcoded in
+      # its Docker creature launch path (the env-gating fix lives in source but
+      # the dist binary predates it). Registering "runsc" as an alias that calls
+      # the stock runc binary is the same workaround used in local testing and
+      # avoids needing a full Cargo rebuild in CI.  storage_opt "size" is also
+      # problematic on non-XFS-pquota filesystems, so we disable it via the
+      # CASPAR_DOCKER_DISK_QUOTA=0 env var already set at the job level (the
+      # old binary reads that var if it was compiled with the env-gating patch;
+      # for truly old binaries the quota just gets silently ignored by Docker on
+      # overlayfs, which is acceptable for CI).
+      - name: Register runsc → runc alias in Docker daemon
+        run: |
+          RUNC=$(command -v runc || echo /usr/bin/runc)
+          sudo tee /etc/docker/daemon.json > /dev/null <<EOF
+          {
+            "runtimes": {
+              "runsc": { "path": "$RUNC" }
+            }
+          }
+          EOF
+          sudo systemctl restart docker
+          # Confirm runsc is now known to Docker
+          docker info --format '{{json .Runtimes}}' | grep -q runsc \
+            && echo "runsc runtime registered OK" \
+            || echo "::warning::runsc not listed in docker info — tool containers may fail"
+            
       # ── Caspar node ──────────────────────────────────────────────────────────
       # run-nodes.sh owns the full node bring-up: it creates the `kasper` Docker
       # bridge network, starts a per-node QuestDB, generates node config + babble

@@ -26,7 +26,7 @@
 #   --caspar-dir DIR       Path to the caspar repo (default: ../caspar).
 #   --tools LIST|all       Tool creatures to deploy (default: a diverse subset).
 #   --node-host-from-vm IP Address creatures use to reach the node
-#                          (default: 172.18.0.1 — the kasper bridge gateway).
+#                          (default: auto-detected kasper bridge gateway).
 #   --keep-running         Leave the Caspar node running after the tests.
 #   --skip-node            Assume a node is already running; skip bring-up.
 #   -h, --help             Show this help.
@@ -41,7 +41,7 @@ CASPAR_DIR="$(cd "$DAVINCI_DIR/.." && pwd)/caspar"
 GEMINI_API_KEY="${GEMINI_API_KEY:-}"
 GEMINI_MODELS="${GEMINI_MODELS:-gemini-flash-latest,gemini-2.5-flash,gemini-2.5-pro}"
 E2E_TOOLS="${E2E_TOOLS:-}"
-NODE_HOST_FROM_VM="${CASPAR_NODE_HOST_FROM_VM:-172.18.0.1}"
+NODE_HOST_FROM_VM="${CASPAR_NODE_HOST_FROM_VM:-}"
 CA_BUNDLE="${CASPAR_CA_BUNDLE:-/etc/ssl/certs/ca-certificates.crt}"
 KEEP_RUNNING=false
 SKIP_NODE=false
@@ -153,6 +153,16 @@ PYEOF
     docker network create kasper >/dev/null 2>&1 && ok "created docker network 'kasper'" \
       || warn "could not create docker network 'kasper'"
   fi
+
+  local gateway
+  gateway="$(docker network inspect kasper --format '{{(index .IPAM.Config 0).Gateway}}' 2>/dev/null || true)"
+  if [[ -z "$NODE_HOST_FROM_VM" ]]; then
+    [[ -n "$gateway" && "$gateway" != "<no value>" ]] \
+      || die "could not resolve kasper bridge gateway"
+    NODE_HOST_FROM_VM="$gateway"
+  fi
+  export DOCKER_HOST_GATEWAY_ADVERTISE_HOST="${DOCKER_HOST_GATEWAY_ADVERTISE_HOST:-$NODE_HOST_FROM_VM}"
+  ok "creatures will dial host via kasper gateway ${DOCKER_HOST_GATEWAY_ADVERTISE_HOST}"
 }
 
 # ─── 2. Bring up the Caspar node ──────────────────────────────────────────────
@@ -182,6 +192,32 @@ PYEOF
   ok "Caspar node is up on 127.0.0.1:8074"
 }
 
+verify_creature_gateway_route() {
+  local gateway current
+  gateway="${DOCKER_HOST_GATEWAY_ADVERTISE_HOST:-$NODE_HOST_FROM_VM}"
+  current="$(docker network inspect kasper --format '{{(index .IPAM.Config 0).Gateway}}' 2>/dev/null || true)"
+  [[ -n "$gateway" ]] || die "creature gateway is not configured"
+  if [[ -n "$current" && "$current" != "<no value>" && "$current" != "$gateway" ]]; then
+    die "kasper gateway changed after node start: prepared=$gateway current=$current"
+  fi
+  docker run --rm -i --network kasper public.ecr.aws/docker/library/python:3.12-slim \
+    python - "$gateway" <<'PYEOF'
+import socket
+import sys
+
+host = sys.argv[1]
+for port in (8074, 8079):
+    sock = socket.socket()
+    sock.settimeout(5)
+    try:
+        sock.connect((host, port))
+    finally:
+        sock.close()
+print(f"kasper route to {host}:8074 and {host}:8079 is reachable")
+PYEOF
+  ok "verified kasper route to node gateway ${gateway}"
+}
+
 stop_node() {
   $KEEP_RUNNING && { info "leaving node running (--keep-running)"; return; }
   info "stopping Caspar node…"
@@ -192,6 +228,7 @@ stop_node() {
 ensure_docker_runsc
 if ! $SKIP_NODE; then
   start_node
+  verify_creature_gateway_route
   trap stop_node EXIT
 else
   info "--skip-node: assuming a Caspar node is already running on 8074"

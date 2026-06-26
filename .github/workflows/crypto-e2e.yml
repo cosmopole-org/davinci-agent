@@ -22,17 +22,6 @@ jobs:
       CASPAR_DOCKER_RUNTIME: runc
       CASPAR_DOCKER_DISK_QUOTA: "0"
       DATA_ROOT: /tmp/caspar
-      # Advertise the docker-host bridge gateway to creatures on the SAME kasper
-      # bridge they are attached to (its gateway IP), where the node listens on
-      # 0.0.0.0:8079 — not on `host.docker.internal`. The gateway authenticates
-      # each creature from its connection's source IP, which must equal the
-      # container's kasper endpoint IP. Dialling `host.docker.internal` (Docker's
-      # `host-gateway`, the default docker0 bridge 172.17.0.1) masquerades the
-      # source across bridges, so the HELLO handshake is rejected ("could not
-      # identify a docker creature for source ip ...") and every tool/agent fails
-      # to serve. run-nodes.sh pins kasper to 172.18.0.0/16 (gateway 172.18.0.1).
-      DOCKER_HOST_GATEWAY_ADVERTISE_HOST: "172.18.0.1"
-
     steps:
       # ── Repos ────────────────────────────────────────────────────────────────
       - name: Check out davinci-agent
@@ -97,6 +86,30 @@ jobs:
             && echo "runsc runtime registered OK" \
             || echo "::warning::runsc not listed in docker info — tool containers may fail"
             
+      # ── Docker bridge used by Caspar creature containers ───────────────────────
+      # Caspar's docker-host gateway authenticates a creature from the source IP
+      # of its TCP connection. The creature must therefore dial the host-side
+      # gateway through the *same* Docker bridge it is attached to (`kasper`), not
+      # through Docker's default host-gateway address. Resolve that bridge gateway
+      # dynamically instead of assuming 172.18.0.1; hosted runners can have
+      # pre-existing Docker networks that shift the chosen subnet and make the
+      # hard-coded address a black hole, which surfaces as Phase 2 serve timeouts.
+      - name: Prepare kasper network gateway env
+        run: |
+          set -euo pipefail
+          if ! docker network inspect kasper >/dev/null 2>&1; then
+            docker network create kasper >/dev/null
+          fi
+          GATEWAY=$(docker network inspect kasper --format '{{(index .IPAM.Config 0).Gateway}}')
+          if [ -z "$GATEWAY" ] || [ "$GATEWAY" = "<no value>" ]; then
+            echo "::error::could not resolve kasper bridge gateway"
+            docker network inspect kasper || true
+            exit 1
+          fi
+          echo "DOCKER_HOST_GATEWAY_ADVERTISE_HOST=$GATEWAY" >> "$GITHUB_ENV"
+          echo "CASPAR_NODE_HOST_FROM_VM=$GATEWAY" >> "$GITHUB_ENV"
+          echo "Using kasper gateway $GATEWAY for creature -> host traffic"
+
       # ── Caspar node ──────────────────────────────────────────────────────────
       # run-nodes.sh owns the full node bring-up: it creates the `kasper` Docker
       # bridge network, starts a per-node QuestDB, generates node config + babble
@@ -122,6 +135,31 @@ jobs:
             --no-firecracker \
             --no-rebuild \
             --skip-deploy
+
+      - name: Verify creature gateway route
+        run: |
+          set -euo pipefail
+          CURRENT_GATEWAY=$(docker network inspect kasper --format '{{(index .IPAM.Config 0).Gateway}}')
+          if [ "$CURRENT_GATEWAY" != "$DOCKER_HOST_GATEWAY_ADVERTISE_HOST" ]; then
+            echo "::error::kasper gateway changed after node start: prepared=$DOCKER_HOST_GATEWAY_ADVERTISE_HOST current=$CURRENT_GATEWAY"
+            docker network inspect kasper || true
+            exit 1
+          fi
+          docker run --rm -i --network kasper public.ecr.aws/docker/library/python:3.12-slim \
+            python - "$DOCKER_HOST_GATEWAY_ADVERTISE_HOST" <<'PY'
+          import socket
+          import sys
+
+          host = sys.argv[1]
+          for port in (8074, 8079):
+              sock = socket.socket()
+              sock.settimeout(5)
+              try:
+                  sock.connect((host, port))
+              finally:
+                  sock.close()
+          print(f"kasper route to {host}:8074 and {host}:8079 is reachable")
+          PY
 
       # ── Run the test ─────────────────────────────────────────────────────────
       - name: Run crypto predictions test

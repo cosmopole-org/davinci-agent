@@ -53,8 +53,12 @@ jobs:
           python -m pip install --upgrade pip
           cd davinci-agent
           pip install -e ".[dev]" 2>/dev/null || pip install -r requirements.txt 2>/dev/null || true
-          # Ensure anthropic SDK is present (AgentRouterClient uses it)
-          pip install anthropic requests 2>/dev/null || true
+          # Ensure runtime deps are present:
+          #   anthropic   — AgentRouterClient transport
+          #   requests    — HTTP for LLM/tool calls
+          #   pycryptodome — RSA-PSS signing of Caspar signaling packets
+          #                  (davinci/caspar_signaling.py imports Crypto.*)
+          pip install anthropic requests pycryptodome
 
       # ── Caspar node ──────────────────────────────────────────────────────────
       # run-nodes.sh owns the full node bring-up: it creates the `kasper` Docker

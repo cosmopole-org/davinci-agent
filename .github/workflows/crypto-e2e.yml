@@ -22,6 +22,16 @@ jobs:
       CASPAR_DOCKER_RUNTIME: runc
       CASPAR_DOCKER_DISK_QUOTA: "0"
       DATA_ROOT: /tmp/caspar
+      # Advertise the docker-host bridge gateway to creatures on the SAME kasper
+      # bridge they are attached to (its gateway IP), where the node listens on
+      # 0.0.0.0:8079 — not on `host.docker.internal`. The gateway authenticates
+      # each creature from its connection's source IP, which must equal the
+      # container's kasper endpoint IP. Dialling `host.docker.internal` (Docker's
+      # `host-gateway`, the default docker0 bridge 172.17.0.1) masquerades the
+      # source across bridges, so the HELLO handshake is rejected ("could not
+      # identify a docker creature for source ip ...") and every tool/agent fails
+      # to serve. run-nodes.sh pins kasper to 172.18.0.0/16 (gateway 172.18.0.1).
+      DOCKER_HOST_GATEWAY_ADVERTISE_HOST: "172.18.0.1"
 
     steps:
       # ── Repos ────────────────────────────────────────────────────────────────

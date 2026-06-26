@@ -60,11 +60,28 @@ def _connect_bridge():
     global _BRIDGE
     if _BRIDGE is not None or _bridge_mod is None:
         return _BRIDGE
-    try:
-        _BRIDGE = _bridge_mod.bridge_from_env()
-    except Exception as exc:  # noqa: BLE001 — never block the tool on bridge setup
-        print(f"TOOL_BRIDGE {json.dumps({'connect_error': repr(exc)[:160]})}", flush=True)
-        _BRIDGE = None
+    # When no gateway is configured (CASPAR_GATEWAY_HOST unset — local/unit
+    # tests) ``bridge_from_env`` returns None *without* connecting, so we fall
+    # straight through to offline mode below. When a gateway IS configured we
+    # retry a few times: the node binds the container's source IP to its identity
+    # (``register_vm_container``) right after starting the container, so a
+    # creature that connects in the first moments can momentarily lose the HELLO
+    # identity race ("could not identify a docker creature for source ip ...").
+    # A handful of short retries closes that window so a serving tool reliably
+    # reaches TOOL_SERVE_READY instead of silently dropping to one-shot mode.
+    attempts = int(os.environ.get("TOOL_BRIDGE_CONNECT_ATTEMPTS", "5"))
+    last_exc = None
+    for attempt in range(1, max(1, attempts) + 1):
+        try:
+            _BRIDGE = _bridge_mod.bridge_from_env()
+            return _BRIDGE
+        except Exception as exc:  # noqa: BLE001 — never block the tool on bridge setup
+            last_exc = exc
+            if attempt < attempts:
+                time.sleep(min(2.0, 0.5 * attempt))
+    print(f"TOOL_BRIDGE {json.dumps({'connect_error': repr(last_exc)[:160], 'attempts': attempts})}",
+          flush=True)
+    _BRIDGE = None
     return _BRIDGE
 
 

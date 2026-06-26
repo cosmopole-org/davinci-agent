@@ -58,14 +58,15 @@ GEMINI_MODELS = [m.strip() for m in os.environ.get("GEMINI_MODELS", "").split(",
 
 # Provider-neutral LLM selection: the agent's reasoning is cross-LLM, so the
 # harness lets you pick the backbone via env without code changes. LLM_PROVIDER
-# (gemini|anthropic|openai|grok) + the matching <PROVIDER>_API_KEY / _MODELS.
+# (gemini|anthropic|openai|grok|agentrouter) + the matching <PROVIDER>_API_KEY / _MODELS.
 # Defaults to Gemini so existing runs are unchanged.
 LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "").strip().lower()
 _PROVIDER_ENVS = {
-    "gemini":    ("GEMINI_API_KEY", "GEMINI_MODELS"),
-    "anthropic": ("ANTHROPIC_API_KEY", "ANTHROPIC_MODELS"),
-    "openai":    ("OPENAI_API_KEY", "OPENAI_MODELS"),
-    "grok":      ("GROK_API_KEY", "GROK_MODELS"),
+    "gemini":      ("GEMINI_API_KEY",      "GEMINI_MODELS"),
+    "anthropic":   ("ANTHROPIC_API_KEY",   "ANTHROPIC_MODELS"),
+    "openai":      ("OPENAI_API_KEY",      "OPENAI_MODELS"),
+    "grok":        ("GROK_API_KEY",        "GROK_MODELS"),
+    "agentrouter": ("AGENTROUTER_API_KEY", "AGENTROUTER_MODELS"),
 }
 
 

@@ -147,5 +147,18 @@ def test_signal_delivery(gateway):
     client.close()
 
 
+def test_signaling_client_unwraps_correlated_signal_shapes():
+    from davinci.caspar_signaling import _find_correlated_signal
+
+    direct = {"kind": "tools/result", "correlationId": "cid", "result": {"ok": True}}
+    wrapped = {"key": "creatures/signal", "data": json.dumps(direct)}
+    stores_wrapped = {"data": json.dumps({"data": json.dumps(direct)})}
+
+    assert _find_correlated_signal(direct, "cid") == direct
+    assert _find_correlated_signal(wrapped, "cid") == direct
+    assert _find_correlated_signal(stores_wrapped, "cid") == direct
+    assert _find_correlated_signal(wrapped, "other") is None
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))

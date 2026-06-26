@@ -326,8 +326,9 @@ class CasparSignalingClient:
                         msg = json.loads(frame[off:])
                     except json.JSONDecodeError:
                         continue
-                    if isinstance(msg, dict) and msg.get("correlationId") == correlation_id:
-                        return {"ok": True, "result": msg}
+                    matched = _find_correlated_signal(msg, correlation_id)
+                    if matched is not None:
+                        return {"ok": True, "result": matched}
                     continue
                 # other tags: ignore and keep reading
         finally:
@@ -351,6 +352,51 @@ class CasparSignalingClient:
             time.sleep(poll)
         return False, logs
 
+
+
+def _maybe_json(value: Any) -> Any:
+    """Decode JSON strings used by Caspar signal wrappers, if present."""
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except json.JSONDecodeError:
+            return value
+    return value
+
+
+def _find_correlated_signal(message: Any, correlation_id: str) -> Optional[Dict[str, Any]]:
+    """Return the signal payload matching ``correlation_id`` across node shapes.
+
+    Caspar has emitted pushed signal updates in a few compatible envelopes over
+    time: sometimes the update payload *is* the caller's packet, sometimes it is
+    wrapped as ``{key, data}``, and program-targeted signals can add a second
+    ``data`` JSON string inside a StoresSend-style object.  The crypto E2E smoke
+    test only cares about the correlated reply packet, so unwrap these transport
+    layers before deciding whether no result arrived.
+    """
+    seen: set[int] = set()
+
+    def walk(value: Any) -> Optional[Dict[str, Any]]:
+        value = _maybe_json(value)
+        if not isinstance(value, dict):
+            return None
+        ident = id(value)
+        if ident in seen:
+            return None
+        seen.add(ident)
+        if value.get("correlationId") == correlation_id:
+            return value
+        # Common pushed-signal wrappers: external socket updates may expose the
+        # signal value under ``data``; StoresSend-style payloads may then encode
+        # the real packet as another JSON string in that same field.
+        for key in ("data", "packet", "payload", "result"):
+            if key in value:
+                found = walk(value.get(key))
+                if found is not None:
+                    return found
+        return None
+
+    return walk(message)
 
 def _log_text(entry: Any) -> str:
     if isinstance(entry, str):

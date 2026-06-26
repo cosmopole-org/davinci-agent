@@ -434,6 +434,25 @@ class GrokClient(OpenAICompatibleClient):
     DEFAULT_MODELS = ["grok-2-latest", "grok-2-vision-latest"]
 
 
+class AgentRouterClient(AnthropicClient):
+    """AgentRouter (agentrouter.org) — a free Anthropic-compatible proxy.
+
+    AgentRouter is a public-welfare relay that forwards requests to the
+    upstream Anthropic API using the same wire format (``POST /v1/messages``,
+    ``x-api-key`` auth, ``anthropic-version`` header). Switching from direct
+    Anthropic to AgentRouter is a one-line config change: set
+    ``ANTHROPIC_BASE_URL=https://agentrouter.org/`` or pass
+    ``llm_provider=agentrouter``.  All Claude models available via the
+    upstream Anthropic API are supported.
+
+    Docs: https://docs.agentrouter.org/
+    """
+
+    provider = "agentrouter"
+    API_URL = "https://agentrouter.org/v1/messages"
+    DEFAULT_MODELS = ["claude-sonnet-4-6", "claude-haiku-4-5-20251001", "claude-opus-4-8"]
+
+
 # --------------------------------------------------------------------------- #
 # Provider registry + construction
 # --------------------------------------------------------------------------- #
@@ -441,11 +460,12 @@ class GrokClient(OpenAICompatibleClient):
 #: provider name → (client class, config/env key aliases for its API key).
 PROVIDERS: Dict[str, Tuple[type, List[str], List[str]]] = {
     # name:        (class,            api_key config keys,        api_key env vars)
-    "gemini":    (GeminiClient,    ["gemini_api_key"],         ["GEMINI_API_KEY"]),
-    "anthropic": (AnthropicClient, ["anthropic_api_key"],      ["ANTHROPIC_API_KEY"]),
-    "openai":    (OpenAIClient,    ["openai_api_key"],         ["OPENAI_API_KEY"]),
-    "grok":      (GrokClient,      ["grok_api_key", "xai_api_key"],
-                                                               ["GROK_API_KEY", "XAI_API_KEY"]),
+    "gemini":      (GeminiClient,        ["gemini_api_key"],          ["GEMINI_API_KEY"]),
+    "anthropic":   (AnthropicClient,     ["anthropic_api_key"],       ["ANTHROPIC_API_KEY"]),
+    "openai":      (OpenAIClient,        ["openai_api_key"],          ["OPENAI_API_KEY"]),
+    "grok":        (GrokClient,          ["grok_api_key", "xai_api_key"],
+                                                                      ["GROK_API_KEY", "XAI_API_KEY"]),
+    "agentrouter": (AgentRouterClient,   ["agentrouter_api_key"],     ["AGENTROUTER_API_KEY"]),
 }
 
 #: friendly aliases users might pass for ``llm_provider``.
@@ -454,6 +474,7 @@ PROVIDER_ALIASES = {
     "claude": "anthropic", "anthropic": "anthropic",
     "openai": "openai", "gpt": "openai", "chatgpt": "openai",
     "grok": "grok", "xai": "grok", "x.ai": "grok",
+    "agentrouter": "agentrouter", "agent_router": "agentrouter", "agentrouter.org": "agentrouter",
 }
 
 
@@ -538,7 +559,7 @@ def client_from_config(config: Dict[str, Any]) -> Optional[LLMClient]:
 
     # 3. auto-detect: first provider that has a key. Gemini first for
     #    backward compatibility with existing deployments.
-    for provider in ("gemini", "anthropic", "openai", "grok"):
+    for provider in ("gemini", "anthropic", "openai", "grok", "agentrouter"):
         api_key = _api_key_for(provider, config)
         if api_key:
             return make_client(provider, api_key, models=_models_for(provider, config))

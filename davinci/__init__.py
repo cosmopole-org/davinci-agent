@@ -25,6 +25,7 @@ from .engine import (
     ToolResult,
 )
 from .llm import (
+    AgentRouterClient,
     AnthropicClient,
     GeminiClient,
     GrokClient,
@@ -54,6 +55,7 @@ __all__ = [
     "Attachment", "attachment_from_file", "materialize_attachments", "INLINE_MAX_BYTES",
     "LLMReasoner", "reasoner_from_config",
     "LLMClient", "GeminiClient", "AnthropicClient", "OpenAIClient",
-    "OpenAICompatibleClient", "GrokClient", "make_client", "client_from_config",
+    "OpenAICompatibleClient", "GrokClient", "AgentRouterClient",
+    "make_client", "client_from_config",
     "__version__",
 ]

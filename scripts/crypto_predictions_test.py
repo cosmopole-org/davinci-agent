@@ -171,14 +171,20 @@ def _classify_serve_failure(texts: list) -> str:
     opaque "FAILED to serve".
     """
     nonblank = [t for t in texts if t.strip()]
+    joined = "\n".join(texts)
+    # The node emits these into the VM log stream when docker rejects the
+    # container (e.g. a storage_opt disk quota smaller than the image, an unknown
+    # runtime, or out-of-space) — the real, actionable root cause.
+    for marker in ("CONTAINER_CREATE_FAILED", "CONTAINER_START_FAILED"):
+        if marker in joined:
+            line = next(t for t in texts if marker in t)
+            return "node could not start the container → " + line.strip()[:240]
     if not nonblank:
-        return ("container produced NO logs at all — the node never started it (the "
-                "POST /containers/create was rejected and the node swallows that "
-                "error). Most likely the docker storage_opt disk quota "
+        return ("container produced NO logs at all — the node never started it and "
+                "did not report why. Most likely the docker storage_opt disk quota "
                 "(HostConfig.StorageOpt.size = <disk_gb>G) is smaller than this "
                 "tool's image; raise its disk_gb in TOOL_SERVE_RESOURCES above the "
                 "image size. Check the node log / `docker events` for the real cause")
-    joined = "\n".join(texts)
     # A concrete bridge connect/identity failure is the most specific root cause
     # (the node could not bind the container's source IP, the gateway address was
     # wrong, etc.) — surface it ahead of the generic "unavailable" summary.

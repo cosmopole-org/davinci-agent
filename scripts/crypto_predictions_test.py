@@ -26,6 +26,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+from datetime import date, timedelta
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -44,7 +45,13 @@ def bad(m):  print(f"{RED}[fail]{NC} {m}", flush=True)
 def warn(m): print(f"{YELLOW}[warn]{NC} {m}", flush=True)
 
 
+TODAY = date.today()
+_THIS_YEAR = TODAY.year
+
 TASK_OBJECTIVE = (
+    f"Today's real-world date is {TODAY:%A, %d %B %Y} (i.e. the current year is "
+    f"{_THIS_YEAR}). Use this as your reference 'now' for every date you resolve "
+    "below.\n"
     "Goal: produce a SINGLE number — the average accuracy score (0–100) of the "
     "crypto price predictions made by the CoinMarketCap community trader "
     "'vlad_anderson'.\n"
@@ -66,7 +73,18 @@ TASK_OBJECTIVE = (
     "2) PARSE EACH PREDICTION. From the 10 latest prediction posts, extract for "
     "each one: the cryptocurrency (ticker symbol), the predicted price/target, "
     "and the exact date & time the prediction refers to (the predicting time "
-    "point).\n\n"
+    "point).\n"
+    "   BE PRECISE ABOUT THE YEAR — this is critical, a wrong year fetches the "
+    "wrong historical price and ruins the score. CoinMarketCap shows the newest "
+    "posts with a SHORT date that has NO year (e.g. 'Jun 26') or as a relative "
+    "time (e.g. '2d ago', 'yesterday', '5h ago'). Resolve every such date "
+    f"against today ({TODAY:%d %B %Y}): a bare 'Mon DD' with no year means that "
+    f"day in {_THIS_YEAR} — take the most recent occurrence that is ON OR BEFORE "
+    "today, and NEVER a future date and NEVER silently assume the previous year. "
+    "Convert any relative time by counting back from today's date. Only when a "
+    "post shows an EXPLICIT year (older posts like the pinned 'Aug 4, 2025') do "
+    "you use that printed year. Normalise each resolved date to day-month-year "
+    "and reuse exactly that date when fetching its historical price in step 3.\n\n"
     "3) FETCH THE REAL PRICES FROM THE WEB — THIS IS MANDATORY AND MUST BE DONE "
     "BY ACTUALLY RUNNING CODE. Do NOT skip this, do NOT defer it to a later "
     "'synthesis' step, and do NOT assume or estimate any price. In THIS step you "
@@ -100,8 +118,12 @@ TOOL_IDS = ["web_search", "fetch_url", "browser_automation", "python_exec"]
 
 # Long enough that every tool VM stays alive serving signals for the whole
 # duration of the Davinci run; the tool also self-exits after this idle window.
-TOOL_SERVE_SECONDS = 1200
-DAVINCI_SERVE_SECONDS = 1200
+TOOL_SERVE_SECONDS = 2000
+DAVINCI_SERVE_SECONDS = 2000
+# Davinci's internal wall-clock budget. Kept below the serve/await windows above
+# so the agent finishes and replies before its serving VM is torn down. Raised
+# from the default because the AgentRouter backbone adds latency per LLM call.
+DAVINCI_MAX_WALL_SECONDS = 1800
 
 STORES_WASM = os.environ.get(
     "STORES_WASM",
@@ -225,9 +247,11 @@ def signal_davinci_task(c: CasparSignalingClient, davinci: dict, tool_recs: list
              "risk": t["risk"], "description": t["description"],
              "program_id": t["program_id"], "entity_id": t["entity_id"],
              "machine_id": t["machine_id"], "function": t.get("function", "invoke"),
+             "arg_schema": dt.tool_arg_schema(t["tool_id"]),
              "requires_network": t.get("requires_network", False)}
             for t in tool_recs],
     }
+    config["max_wall_seconds"] = DAVINCI_MAX_WALL_SECONDS
     if store_cfg:
         config["store"] = store_cfg
     envelope = {"kind": "task", "objective": TASK_OBJECTIVE,

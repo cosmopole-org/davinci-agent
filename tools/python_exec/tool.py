@@ -34,7 +34,7 @@ import sys
 import tempfile
 import textwrap
 
-DEFAULT_TIMEOUT = 30
+DEFAULT_TIMEOUT = 120
 MAX_TIMEOUT = 300
 MAX_OUTPUT = 200_000  # bytes of captured stdout/stderr to return
 

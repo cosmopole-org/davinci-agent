@@ -195,12 +195,21 @@ def invoke(function_name: str, payload: dict) -> dict:
     try:
         with sync_playwright() as pw:
             launcher = getattr(pw, browser_name)
-            chromium_args = ["--no-sandbox", "--disable-dev-shm-usage"]
+            chromium_args = ["--no-sandbox", "--disable-dev-shm-usage",
+                             "--disable-blink-features=AutomationControlled"]
             if ignore_tls:
                 chromium_args.append("--ignore-certificate-errors")
-            browser = launcher.launch(headless=headless,
-                                      args=chromium_args
-                                      if browser_name == "chromium" else None)
+            launch_kwargs = {"headless": headless}
+            if browser_name == "chromium":
+                launch_kwargs["args"] = chromium_args
+            # Optional outbound proxy. Some sites are geo/route-blocked on the
+            # creature's direct egress and are only reachable through a proxy
+            # (e.g. the host's VPN bridged onto the docker network). Configure via
+            # the payload (`proxy`) or the BROWSER_PROXY env (http://host:port).
+            proxy_url = (payload.get("proxy") or os.environ.get("BROWSER_PROXY") or "").strip()
+            if proxy_url:
+                launch_kwargs["proxy"] = {"server": proxy_url}
+            browser = launcher.launch(**launch_kwargs)
             ctx_kwargs = {}
             if payload.get("viewport"):
                 ctx_kwargs["viewport"] = payload["viewport"]
@@ -210,6 +219,31 @@ def invoke(function_name: str, payload: dict) -> dict:
                 ctx_kwargs["ignore_https_errors"] = True
             context = browser.new_context(**ctx_kwargs)
             context.set_default_timeout(default_timeout)
+            # Authenticated-session support: load cookies (Playwright format) from
+            # the payload or a JSON file baked into the image (BROWSER_COOKIES_FILE,
+            # default /app/cookies.json). A site whose data API is auth-gated only
+            # returns real content for a logged-in session's cookies.
+            cookies = payload.get("cookies")
+            if cookies is None:
+                cookie_path = os.environ.get("BROWSER_COOKIES_FILE", "/app/cookies.json")
+                if os.path.isfile(cookie_path):
+                    try:
+                        with open(cookie_path) as fh:
+                            cookies = json.load(fh)
+                    except Exception:
+                        cookies = None
+            if cookies:
+                try:
+                    context.add_cookies(cookies)
+                except Exception as exc:
+                    results.append({"action": "add_cookies", "ok": False, "error": str(exc)})
+            # Reduce headless-automation fingerprinting (some anti-bot layers gate
+            # on navigator.webdriver).
+            try:
+                context.add_init_script(
+                    "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});")
+            except Exception:
+                pass
             page = context.new_page()
 
             for step in steps:

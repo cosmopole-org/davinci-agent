@@ -24,7 +24,11 @@
       "args": {
         "code": {
           "type": "STRING",
-          "desc": "python code to execute"
+          "desc": "runnable python code; assign the final value to a variable named result and/or print() values you need captured"
+        },
+        "timeout": {
+          "type": "INT",
+          "desc": "max seconds to run (default 120, up to 300) — raise it when the code makes many network calls, e.g. fetching prices for several coins"
         }
       }
     }

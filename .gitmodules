@@ -1,0 +1,6 @@
+[submodule "caspar"]
+	path = caspar
+	url = https://github.com/cosmopole-org/caspar
+[submodule "decillionai-server"]
+	path = decillionai-server
+	url = https://github.com/DecillionAI/decillionai-server

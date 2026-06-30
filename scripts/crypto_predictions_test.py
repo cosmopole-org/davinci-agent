@@ -120,6 +120,26 @@ TOOL_IDS = ["web_search", "fetch_url", "browser_automation", "python_exec"]
 # duration of the Davinci run; the tool also self-exits after this idle window.
 TOOL_SERVE_SECONDS = 2000
 DAVINCI_SERVE_SECONDS = 2000
+
+# Per-tool serving-VM resources + how long to wait for TOOL_SERVE_READY.
+#
+# The serve path itself (tool_runtime._serve) is image-agnostic — it prints
+# TOOL_SERVE_READY the moment the gateway bridge connects, before any tool
+# dependency is imported. So the only thing that varies the time-to-ready across
+# tools is how long the node takes to BOOT the container. browser_automation
+# ships the multi-GB ``mcr.microsoft.com/playwright/python`` image; under gVisor
+# (runsc --platform=ptrace) the gofer has to serve that large rootfs, so its
+# container can take far longer to start than the ~150 MB slim-python tools,
+# overrunning the default 150 s window and being reported "FAILED to serve".
+# It also needs enough RAM to actually launch headless Chromium once it is
+# serving (both for the smoke-signal below and the real Davinci-driven run) —
+# 320 MB OOMs the browser. Heavy tools therefore get more RAM, more disk
+# headroom and a longer serve-ready window; the light tools keep the lean
+# defaults so the run stays within the CI runner's memory budget.
+_DEFAULT_SERVE = {"ram_mb": 320, "disk_gb": 1, "ready_timeout": 150}
+TOOL_SERVE_RESOURCES = {
+    "browser_automation": {"ram_mb": 1536, "disk_gb": 4, "ready_timeout": 300},
+}
 # Davinci's internal wall-clock budget. Kept below the serve/await windows above
 # so the agent finishes and replies before its serving VM is torn down. Raised
 # from the default because the AgentRouter backbone adds latency per LLM call.
@@ -135,10 +155,13 @@ STORES_WASM = os.environ.get(
 # --------------------------------------------------------------------------- #
 
 def start_tool_serving(c: CasparSignalingClient, rec: dict) -> bool:
+    res = TOOL_SERVE_RESOURCES.get(rec["tool_id"], _DEFAULT_SERVE)
     vm_id = c.run_entity(rec["program_id"], rec["entity_id"], params={},
-                         ram_mb=320, max_exec_seconds=TOOL_SERVE_SECONDS)
+                         ram_mb=res["ram_mb"], disk_gb=res["disk_gb"],
+                         max_exec_seconds=TOOL_SERVE_SECONDS)
     rec["serve_vm"] = vm_id
-    found, _ = c.wait_for_vm_log(vm_id, "TOOL_SERVE_READY", timeout=150, poll=3)
+    found, _ = c.wait_for_vm_log(vm_id, "TOOL_SERVE_READY",
+                                 timeout=res["ready_timeout"], poll=3)
     (ok if found else bad)(
         f"tool {rec['tool_id']} {'serving' if found else 'FAILED to serve'} (vm={vm_id})")
     return found

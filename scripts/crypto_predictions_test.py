@@ -34,7 +34,7 @@ sys.path.insert(0, str(REPO))
 sys.path.insert(0, str(REPO / "scripts"))
 
 import deploy_and_test as dt  # noqa: E402
-from davinci.caspar_signaling import CasparSignalingClient  # noqa: E402
+from davinci.caspar_signaling import CasparSignalingClient, _log_text  # noqa: E402
 
 GREEN, RED, CYAN, YELLOW, NC = dt.GREEN, dt.RED, dt.CYAN, "\033[0;33m", dt.NC
 
@@ -123,22 +123,30 @@ DAVINCI_SERVE_SECONDS = 2000
 
 # Per-tool serving-VM resources + how long to wait for TOOL_SERVE_READY.
 #
-# The serve path itself (tool_runtime._serve) is image-agnostic — it prints
-# TOOL_SERVE_READY the moment the gateway bridge connects, before any tool
-# dependency is imported. So the only thing that varies the time-to-ready across
-# tools is how long the node takes to BOOT the container. browser_automation
-# ships the multi-GB ``mcr.microsoft.com/playwright/python`` image; under gVisor
-# (runsc --platform=ptrace) the gofer has to serve that large rootfs, so its
-# container can take far longer to start than the ~150 MB slim-python tools,
-# overrunning the default 150 s window and being reported "FAILED to serve".
-# It also needs enough RAM to actually launch headless Chromium once it is
-# serving (both for the smoke-signal below and the real Davinci-driven run) —
-# 320 MB OOMs the browser. Heavy tools therefore get more RAM, more disk
-# headroom and a longer serve-ready window; the light tools keep the lean
-# defaults so the run stays within the CI runner's memory budget.
+# ROOT CAUSE of "tool browser_automation FAILED to serve" (the disk_gb field):
+# the Caspar node creates each creature container with a per-container docker
+# disk quota — ``HostConfig.StorageOpt = {"size": "<disk_gb>G"}`` — and docker
+# requires that quota to be >= the image's virtual size, otherwise
+# ``POST /containers/create`` is rejected. browser_automation ships the
+# ~3.6 GB ``mcr.microsoft.com/playwright/python`` image, so the default
+# disk_gb=1 (a 1 GB quota) makes its container impossible to create on any
+# storage driver that enforces storage_opt, while the slim-python tools
+# (images < 1 GB) fit and serve fine — exactly the "only the browser fails"
+# symptom. The node creates containers fire-and-forget and swallows the 400, so
+# it only ever surfaces as the opaque "FAILED to serve". (The node's prebuilt
+# binary applies this quota even when CASPAR_DOCKER_DISK_QUOTA=0 is set, so the
+# fix has to come from the resource request here: give the browser a quota
+# comfortably larger than its image.)
+#
+# The browser VM also needs real RAM to launch headless Chromium once serving
+# (the smoke-signal below and the real Davinci-driven run) — 320 MB OOMs it —
+# and a longer ready window, since under gVisor the gofer serving that large
+# rootfs can take a while to boot. The light tools keep the lean defaults so the
+# run stays within the CI runner's memory budget.
 _DEFAULT_SERVE = {"ram_mb": 320, "disk_gb": 1, "ready_timeout": 150}
 TOOL_SERVE_RESOURCES = {
-    "browser_automation": {"ram_mb": 1536, "disk_gb": 4, "ready_timeout": 300},
+    # disk_gb=8 → an 8 GB storage_opt quota, well above the ~3.6 GB image.
+    "browser_automation": {"ram_mb": 1536, "disk_gb": 8, "ready_timeout": 300},
 }
 # Davinci's internal wall-clock budget. Kept below the serve/await windows above
 # so the agent finishes and replies before its serving VM is torn down. Raised
@@ -154,17 +162,70 @@ STORES_WASM = os.environ.get(
 # Phase 2 — start tools as standalone serving VMs + smoke-signal each
 # --------------------------------------------------------------------------- #
 
+def _classify_serve_failure(texts: list) -> str:
+    """Turn a serving VM's log tail into a one-line, actionable reason.
+
+    The tool runtime emits explicit markers (TOOL_SERVE_BEGIN /
+    TOOL_SERVE_UNAVAILABLE / TOOL_BRIDGE / TOOL_RESPONSE); read them so the
+    harness reports *why* a tool never reached TOOL_SERVE_READY instead of the
+    opaque "FAILED to serve".
+    """
+    nonblank = [t for t in texts if t.strip()]
+    joined = "\n".join(texts)
+    # The node emits these into the VM log stream when docker rejects the
+    # container (e.g. a storage_opt disk quota smaller than the image, an unknown
+    # runtime, or out-of-space) — the real, actionable root cause.
+    for marker in ("CONTAINER_CREATE_FAILED", "CONTAINER_START_FAILED"):
+        if marker in joined:
+            line = next(t for t in texts if marker in t)
+            return "node could not start the container → " + line.strip()[:240]
+    if not nonblank:
+        return ("container produced NO logs at all — the node never started it and "
+                "did not report why. Most likely the docker storage_opt disk quota "
+                "(HostConfig.StorageOpt.size = <disk_gb>G) is smaller than this "
+                "tool's image; raise its disk_gb in TOOL_SERVE_RESOURCES above the "
+                "image size. Check the node log / `docker events` for the real cause")
+    # A concrete bridge connect/identity failure is the most specific root cause
+    # (the node could not bind the container's source IP, the gateway address was
+    # wrong, etc.) — surface it ahead of the generic "unavailable" summary.
+    if "connect_error" in joined or "could not identify" in joined:
+        line = next(t for t in texts if "connect_error" in t or "could not identify" in t)
+        return "bridge connect/identity error → " + line.strip()[:240]
+    if "TOOL_SERVE_UNAVAILABLE" in joined:
+        line = next(t for t in texts if "TOOL_SERVE_UNAVAILABLE" in t)
+        return "gateway bridge unavailable → " + line.split("TOOL_SERVE_UNAVAILABLE", 1)[-1].strip()
+    if "TOOL_SERVE_BEGIN" not in joined:
+        return ("runtime never reached main()/TOOL_SERVE_BEGIN — the container is "
+                "not running tool_runtime.py (wrong CMD/entrypoint or import crash)")
+    if "TOOL_RESPONSE" in joined and "TOOL_SERVE_READY" not in joined:
+        return "tool ran one-shot offline (no bridge) and exited without entering the serve loop"
+    if "Traceback" in joined or "Error" in joined:
+        line = next(t for t in texts if "Traceback" in t or "Error" in t)
+        return "tool crashed → " + line.strip()[:240]
+    return ("timed out waiting for TOOL_SERVE_READY — TOOL_SERVE_BEGIN was logged "
+            "but the bridge handshake never completed (still booting or stuck)")
+
+
 def start_tool_serving(c: CasparSignalingClient, rec: dict) -> bool:
     res = TOOL_SERVE_RESOURCES.get(rec["tool_id"], _DEFAULT_SERVE)
     vm_id = c.run_entity(rec["program_id"], rec["entity_id"], params={},
                          ram_mb=res["ram_mb"], disk_gb=res["disk_gb"],
                          max_exec_seconds=TOOL_SERVE_SECONDS)
     rec["serve_vm"] = vm_id
-    found, _ = c.wait_for_vm_log(vm_id, "TOOL_SERVE_READY",
-                                 timeout=res["ready_timeout"], poll=3)
-    (ok if found else bad)(
-        f"tool {rec['tool_id']} {'serving' if found else 'FAILED to serve'} (vm={vm_id})")
-    return found
+    found, logs = c.wait_for_vm_log(vm_id, "TOOL_SERVE_READY",
+                                    timeout=res["ready_timeout"], poll=3)
+    if found:
+        ok(f"tool {rec['tool_id']} serving (vm={vm_id})")
+        return True
+    # Surface the actual cause — a bare "FAILED to serve" is un-actionable.
+    texts = [_log_text(l) for l in logs]
+    bad(f"tool {rec['tool_id']} FAILED to serve (vm={vm_id}): {_classify_serve_failure(texts)}")
+    tail = [t for t in texts if t.strip()][-15:]
+    if tail:
+        warn(f"{rec['tool_id']} serving-VM log tail ({len(tail)} lines):")
+        for t in tail:
+            print(f"      | {t[:240]}", flush=True)
+    return False
 
 
 def smoke_signal_tool(c: CasparSignalingClient, rec: dict) -> bool:

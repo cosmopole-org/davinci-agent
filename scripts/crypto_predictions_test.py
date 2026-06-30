@@ -34,7 +34,7 @@ sys.path.insert(0, str(REPO))
 sys.path.insert(0, str(REPO / "scripts"))
 
 import deploy_and_test as dt  # noqa: E402
-from davinci.caspar_signaling import CasparSignalingClient  # noqa: E402
+from davinci.caspar_signaling import CasparSignalingClient, _log_text  # noqa: E402
 
 GREEN, RED, CYAN, YELLOW, NC = dt.GREEN, dt.RED, dt.CYAN, "\033[0;33m", dt.NC
 
@@ -154,17 +154,60 @@ STORES_WASM = os.environ.get(
 # Phase 2 — start tools as standalone serving VMs + smoke-signal each
 # --------------------------------------------------------------------------- #
 
+def _classify_serve_failure(texts: list) -> str:
+    """Turn a serving VM's log tail into a one-line, actionable reason.
+
+    The tool runtime emits explicit markers (TOOL_SERVE_BEGIN /
+    TOOL_SERVE_UNAVAILABLE / TOOL_BRIDGE / TOOL_RESPONSE); read them so the
+    harness reports *why* a tool never reached TOOL_SERVE_READY instead of the
+    opaque "FAILED to serve".
+    """
+    nonblank = [t for t in texts if t.strip()]
+    if not nonblank:
+        return ("container produced NO logs at all — it never started or crashed "
+                "before its first print (image/boot/runtime failure)")
+    joined = "\n".join(texts)
+    # A concrete bridge connect/identity failure is the most specific root cause
+    # (the node could not bind the container's source IP, the gateway address was
+    # wrong, etc.) — surface it ahead of the generic "unavailable" summary.
+    if "connect_error" in joined or "could not identify" in joined:
+        line = next(t for t in texts if "connect_error" in t or "could not identify" in t)
+        return "bridge connect/identity error → " + line.strip()[:240]
+    if "TOOL_SERVE_UNAVAILABLE" in joined:
+        line = next(t for t in texts if "TOOL_SERVE_UNAVAILABLE" in t)
+        return "gateway bridge unavailable → " + line.split("TOOL_SERVE_UNAVAILABLE", 1)[-1].strip()
+    if "TOOL_SERVE_BEGIN" not in joined:
+        return ("runtime never reached main()/TOOL_SERVE_BEGIN — the container is "
+                "not running tool_runtime.py (wrong CMD/entrypoint or import crash)")
+    if "TOOL_RESPONSE" in joined and "TOOL_SERVE_READY" not in joined:
+        return "tool ran one-shot offline (no bridge) and exited without entering the serve loop"
+    if "Traceback" in joined or "Error" in joined:
+        line = next(t for t in texts if "Traceback" in t or "Error" in t)
+        return "tool crashed → " + line.strip()[:240]
+    return ("timed out waiting for TOOL_SERVE_READY — TOOL_SERVE_BEGIN was logged "
+            "but the bridge handshake never completed (still booting or stuck)")
+
+
 def start_tool_serving(c: CasparSignalingClient, rec: dict) -> bool:
     res = TOOL_SERVE_RESOURCES.get(rec["tool_id"], _DEFAULT_SERVE)
     vm_id = c.run_entity(rec["program_id"], rec["entity_id"], params={},
                          ram_mb=res["ram_mb"], disk_gb=res["disk_gb"],
                          max_exec_seconds=TOOL_SERVE_SECONDS)
     rec["serve_vm"] = vm_id
-    found, _ = c.wait_for_vm_log(vm_id, "TOOL_SERVE_READY",
-                                 timeout=res["ready_timeout"], poll=3)
-    (ok if found else bad)(
-        f"tool {rec['tool_id']} {'serving' if found else 'FAILED to serve'} (vm={vm_id})")
-    return found
+    found, logs = c.wait_for_vm_log(vm_id, "TOOL_SERVE_READY",
+                                    timeout=res["ready_timeout"], poll=3)
+    if found:
+        ok(f"tool {rec['tool_id']} serving (vm={vm_id})")
+        return True
+    # Surface the actual cause — a bare "FAILED to serve" is un-actionable.
+    texts = [_log_text(l) for l in logs]
+    bad(f"tool {rec['tool_id']} FAILED to serve (vm={vm_id}): {_classify_serve_failure(texts)}")
+    tail = [t for t in texts if t.strip()][-15:]
+    if tail:
+        warn(f"{rec['tool_id']} serving-VM log tail ({len(tail)} lines):")
+        for t in tail:
+            print(f"      | {t[:240]}", flush=True)
+    return False
 
 
 def smoke_signal_tool(c: CasparSignalingClient, rec: dict) -> bool:

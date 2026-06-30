@@ -69,7 +69,13 @@ def _connect_bridge():
     # identity race ("could not identify a docker creature for source ip ...").
     # A handful of short retries closes that window so a serving tool reliably
     # reaches TOOL_SERVE_READY instead of silently dropping to one-shot mode.
-    attempts = int(os.environ.get("TOOL_BRIDGE_CONNECT_ATTEMPTS", "5"))
+    # Heavy images (browser_automation's multi-GB Playwright image) boot far
+    # slower under gVisor, so they have more startup variance and may need a
+    # wider retry window before the node↔container identity settles — hence the
+    # env-tunable attempt count and the per-attempt logging below, which makes a
+    # persistent identity failure (vs. a transient one that later succeeds)
+    # diagnosable straight from the VM logs.
+    attempts = int(os.environ.get("TOOL_BRIDGE_CONNECT_ATTEMPTS", "8"))
     last_exc = None
     for attempt in range(1, max(1, attempts) + 1):
         try:
@@ -77,9 +83,12 @@ def _connect_bridge():
             return _BRIDGE
         except Exception as exc:  # noqa: BLE001 — never block the tool on bridge setup
             last_exc = exc
+            print("TOOL_BRIDGE " + json.dumps(
+                {"connect_attempt": attempt, "of": attempts, "error": repr(exc)[:200]}),
+                flush=True)
             if attempt < attempts:
-                time.sleep(min(2.0, 0.5 * attempt))
-    print(f"TOOL_BRIDGE {json.dumps({'connect_error': repr(last_exc)[:160], 'attempts': attempts})}",
+                time.sleep(min(3.0, 0.5 * attempt))
+    print(f"TOOL_BRIDGE {json.dumps({'connect_error': repr(last_exc)[:200], 'attempts': attempts, 'gave_up': True})}",
           flush=True)
     _BRIDGE = None
     return _BRIDGE
@@ -340,10 +349,34 @@ def main() -> int:
     # world. When present, the tool runs as a long-lived standalone creature that
     # is driven purely through the signaling API. With no gateway (local/unit
     # tests) it falls back to a single offline dispatch.
+    gateway_host = os.environ.get("CASPAR_GATEWAY_HOST", "").strip()
+    # Announce the serve preconditions up front so the VM logs are conclusive
+    # about *why* a tool did (or did not) reach the serve loop — a bare
+    # "FAILED to serve" in the harness is otherwise un-actionable.
+    print("TOOL_SERVE_BEGIN " + json.dumps({
+        "tool_id": TOOL_ID or "unknown",
+        "gateway_host": gateway_host or None,
+        "gateway_port": os.environ.get("CASPAR_GATEWAY_PORT", "") or None,
+        "bridge_module": _bridge_mod is not None,
+    }), flush=True)
     bridge = _connect_bridge()
     if bridge is not None:
         print(f"TOOL_BRIDGE {json.dumps({'connected': True, 'session': bridge.session_id})}", flush=True)
         return _serve(bridge)
+    # No live gateway bridge ⇒ we cannot serve. Without this marker the runtime
+    # would silently drop to a one-shot offline dispatch that prints TOOL_RESPONSE
+    # and exits, never emitting TOOL_SERVE_READY — which the harness can only
+    # report as the opaque "FAILED to serve". State the reason explicitly.
+    print("TOOL_SERVE_UNAVAILABLE " + json.dumps({
+        "tool_id": TOOL_ID or "unknown",
+        "gateway_host_set": bool(gateway_host),
+        "bridge_module": _bridge_mod is not None,
+        "reason": ("CASPAR_GATEWAY_HOST not present in container env — the node did "
+                   "not inject the gateway address (not gateway-managed)"
+                   if not gateway_host else
+                   "gateway configured but the bridge could not connect/identify — "
+                   "see the TOOL_BRIDGE connect_error line above"),
+    }), flush=True)
     return _run_once_offline()
 
 

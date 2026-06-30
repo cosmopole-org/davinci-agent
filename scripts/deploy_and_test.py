@@ -154,6 +154,30 @@ def tool_full_metadata(tool_id: str) -> dict:
         return {}
 
 
+_JSON_TYPES = {"STRING": "string", "INT": "integer", "INTEGER": "integer",
+               "NUMBER": "number", "FLOAT": "number", "BOOL": "boolean",
+               "BOOLEAN": "boolean", "OBJECT": "object", "ARRAY": "array", "LIST": "array"}
+
+
+def tool_arg_schema(tool_id: str) -> dict:
+    """JSON-Schema ``properties`` for a tool's primary function, derived from its
+    point.metadata.json ``tools[].args``.
+
+    Carried in the tool catalog so Davinci's LLM reasoner emits each tool's real
+    argument names (e.g. python_exec's ``code``, web_search's ``query``) instead
+    of falling back to a generic ``task`` — without the schema the model has no
+    way to know the contract and the fallback ships the objective text as code.
+    """
+    funcs = tool_full_metadata(tool_id).get("tools") or []
+    args = (funcs[0].get("args") or {}) if funcs else {}
+    props: dict = {}
+    for name, spec in args.items():
+        spec = spec or {}
+        props[name] = {"type": _JSON_TYPES.get(str(spec.get("type", "STRING")).upper(), "string"),
+                       "description": spec.get("desc", "")}
+    return props
+
+
 def deploy_wasm_creature(c: CasparSignalingClient, namespace: str, wasm_path: Path,
                          entity_id: str = "main") -> dict:
     """Deploy a WASM miniapp creature (e.g. the Decillion ``stores`` namespace).
@@ -296,6 +320,31 @@ def deploy_tool(c: CasparSignalingClient, tool: dict) -> dict:
         files["ca-certificates.crt"] = b64_bytes(ca)
         dockerfile = dockerfile + b"\n" + CA_DOCKERFILE_SNIPPET.encode()
 
+    # browser_automation: optionally bake in an authenticated-session cookie jar
+    # (BROWSER_COOKIES_FILE) and an outbound proxy (BROWSER_PROXY) so the headless
+    # browser can reach + authenticate to sites that are geo/route-blocked or
+    # auth-gated on the creature's direct egress. Both are read from this harness's
+    # environment only — never written to the repo or committed.
+    if tid == "browser_automation":
+        cookies_file = os.environ.get("BROWSER_COOKIES_FILE", "").strip()
+        if cookies_file and Path(cookies_file).exists():
+            files["cookies.json"] = b64_file(Path(cookies_file))
+        proxy = os.environ.get("BROWSER_PROXY", "").strip()
+        if proxy:
+            dockerfile = dockerfile + f"\nENV BROWSER_PROXY={proxy}\n".encode()
+
+    # Code/HTTP tools fetch from sites that may be geo/route-blocked on the
+    # creature's direct egress (e.g. Binance returns connection-refused from a
+    # datacenter IP). Bake the proxy as HTTPS_PROXY/HTTP_PROXY so the `requests`
+    # library inside python_exec (and the HTTP tools) routes through it. The
+    # python_exec subprocess inherits the container env, so user code picks it up.
+    tool_proxy = (os.environ.get("TOOL_HTTP_PROXY")
+                  or os.environ.get("BROWSER_PROXY", "")).strip()
+    if tool_proxy and tid in ("python_exec", "fetch_url", "web_search"):
+        dockerfile = dockerfile + (
+            f"\nENV HTTPS_PROXY={tool_proxy} HTTP_PROXY={tool_proxy} "
+            f"https_proxy={tool_proxy} http_proxy={tool_proxy}\n").encode()
+
     c.deploy(program_id, tid, "docker", b64_bytes(dockerfile), files_b64=files)
     if not wait_for_image(program_id, tid, timeout=BUILD_TIMEOUT.get(tid, 300)):
         raise RuntimeError(f"image for tool {tid} not built in time")
@@ -355,6 +404,7 @@ def signal_davinci(c: CasparSignalingClient, davinci: dict, tool_recs: list) -> 
                          "risk": t["risk"], "description": t["description"],
                          "program_id": t["program_id"], "entity_id": t["entity_id"],
                          "function": t.get("function", "invoke"),
+                         "arg_schema": tool_arg_schema(t["tool_id"]),
                          "requires_network": t.get("requires_network", False)}
                         for t in tool_recs]}
     vm_id = c.run_entity(davinci["program_id"], "davinci",

@@ -228,6 +228,12 @@ def _registry_from_tool_catalog(tools: List[Dict[str, Any]]) -> ToolRegistry:
     """Build a registry from a DAVINCI_TOOLS_JSON catalog of deployed tool creatures."""
     reg = ToolRegistry()
     for t in tools:
+        # Carry the tool's input schema (catalog ``arg_schema``) so the LLM
+        # reasoner emits the tool's real argument names (e.g. python_exec's
+        # ``code``) instead of the generic ``task`` fallback.
+        arg_schema = t.get("arg_schema") or {}
+        schema = {"type": "object", "properties": arg_schema,
+                  "required": list(arg_schema.keys())} if arg_schema else None
         reg.register(ToolDescriptor(
             name=t.get("name") or f"caspar__{t['tool_id']}",
             description=t.get("description", t["tool_id"]),
@@ -235,6 +241,7 @@ def _registry_from_tool_catalog(tools: List[Dict[str, Any]]) -> ToolRegistry:
             risk=t.get("risk", "low"),
             requires_network=bool(t.get("requires_network", False)),
             server="caspar",
+            _schema=schema,
         ))
     return reg
 
@@ -390,7 +397,15 @@ def _run_agent(bridge: Any, task: Dict[str, Any], config: Dict[str, Any],
         executor=executor,
         planner=planner,    # None -> engine default (deterministic Planner)
         tracer=tracer,
-        budget=Budget(max_steps=int(os.environ.get("DAVINCI_MAX_STEPS", "20"))),
+        budget=Budget(
+            max_steps=int(config.get("max_steps")
+                          or os.environ.get("DAVINCI_MAX_STEPS", "20")),
+            # Wall-clock ceiling. The default suits fast LLM backends; relays that
+            # add latency per call (e.g. AgentRouter routing through pooled OAuth
+            # backends) need a larger budget to finish a multi-step, multi-tool
+            # task, so let the task config raise it.
+            max_wall_seconds=float(config.get("max_wall_seconds")
+                                   or os.environ.get("DAVINCI_MAX_WALL_SECONDS", "900"))),
     )
 
     sandbox_enabled = bridge is not None and _sandbox_enabled(tools_by_name)

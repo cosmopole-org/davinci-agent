@@ -384,6 +384,17 @@ def deploy_davinci(c: CasparSignalingClient) -> dict:
     if ca is not None:
         files["ca-certificates.crt"] = b64_bytes(ca)
         dockerfile = dockerfile + CA_DOCKERFILE_SNIPPET
+    # When egress needs a proxy (e.g. the LLM relay is geo/IP-blocked on the
+    # creature's direct route), route the agent's own outbound HTTP — i.e. its
+    # LLM-backbone calls — through it as well. The agent uses urllib, which
+    # honours HTTPS_PROXY/HTTP_PROXY; the Caspar bridge is a raw socket and is
+    # unaffected. Opt-in via LLM_HTTPS_PROXY (falls back to the tool proxy).
+    llm_proxy = (os.environ.get("LLM_HTTPS_PROXY") or os.environ.get("TOOL_HTTP_PROXY")
+                 or os.environ.get("BROWSER_PROXY", "")).strip()
+    if llm_proxy:
+        dockerfile = dockerfile + (
+            f"ENV HTTPS_PROXY={llm_proxy} HTTP_PROXY={llm_proxy} "
+            f"https_proxy={llm_proxy} http_proxy={llm_proxy}\n")
     c.deploy(program_id, "davinci", "docker", b64_bytes(dockerfile.encode()), files_b64=files)
     if not wait_for_image(program_id, "davinci", timeout=360):
         raise RuntimeError("davinci image not built in time")

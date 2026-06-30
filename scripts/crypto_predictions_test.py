@@ -123,22 +123,30 @@ DAVINCI_SERVE_SECONDS = 2000
 
 # Per-tool serving-VM resources + how long to wait for TOOL_SERVE_READY.
 #
-# The serve path itself (tool_runtime._serve) is image-agnostic — it prints
-# TOOL_SERVE_READY the moment the gateway bridge connects, before any tool
-# dependency is imported. So the only thing that varies the time-to-ready across
-# tools is how long the node takes to BOOT the container. browser_automation
-# ships the multi-GB ``mcr.microsoft.com/playwright/python`` image; under gVisor
-# (runsc --platform=ptrace) the gofer has to serve that large rootfs, so its
-# container can take far longer to start than the ~150 MB slim-python tools,
-# overrunning the default 150 s window and being reported "FAILED to serve".
-# It also needs enough RAM to actually launch headless Chromium once it is
-# serving (both for the smoke-signal below and the real Davinci-driven run) —
-# 320 MB OOMs the browser. Heavy tools therefore get more RAM, more disk
-# headroom and a longer serve-ready window; the light tools keep the lean
-# defaults so the run stays within the CI runner's memory budget.
+# ROOT CAUSE of "tool browser_automation FAILED to serve" (the disk_gb field):
+# the Caspar node creates each creature container with a per-container docker
+# disk quota — ``HostConfig.StorageOpt = {"size": "<disk_gb>G"}`` — and docker
+# requires that quota to be >= the image's virtual size, otherwise
+# ``POST /containers/create`` is rejected. browser_automation ships the
+# ~3.6 GB ``mcr.microsoft.com/playwright/python`` image, so the default
+# disk_gb=1 (a 1 GB quota) makes its container impossible to create on any
+# storage driver that enforces storage_opt, while the slim-python tools
+# (images < 1 GB) fit and serve fine — exactly the "only the browser fails"
+# symptom. The node creates containers fire-and-forget and swallows the 400, so
+# it only ever surfaces as the opaque "FAILED to serve". (The node's prebuilt
+# binary applies this quota even when CASPAR_DOCKER_DISK_QUOTA=0 is set, so the
+# fix has to come from the resource request here: give the browser a quota
+# comfortably larger than its image.)
+#
+# The browser VM also needs real RAM to launch headless Chromium once serving
+# (the smoke-signal below and the real Davinci-driven run) — 320 MB OOMs it —
+# and a longer ready window, since under gVisor the gofer serving that large
+# rootfs can take a while to boot. The light tools keep the lean defaults so the
+# run stays within the CI runner's memory budget.
 _DEFAULT_SERVE = {"ram_mb": 320, "disk_gb": 1, "ready_timeout": 150}
 TOOL_SERVE_RESOURCES = {
-    "browser_automation": {"ram_mb": 1536, "disk_gb": 4, "ready_timeout": 300},
+    # disk_gb=8 → an 8 GB storage_opt quota, well above the ~3.6 GB image.
+    "browser_automation": {"ram_mb": 1536, "disk_gb": 8, "ready_timeout": 300},
 }
 # Davinci's internal wall-clock budget. Kept below the serve/await windows above
 # so the agent finishes and replies before its serving VM is torn down. Raised
@@ -164,8 +172,12 @@ def _classify_serve_failure(texts: list) -> str:
     """
     nonblank = [t for t in texts if t.strip()]
     if not nonblank:
-        return ("container produced NO logs at all — it never started or crashed "
-                "before its first print (image/boot/runtime failure)")
+        return ("container produced NO logs at all — the node never started it (the "
+                "POST /containers/create was rejected and the node swallows that "
+                "error). Most likely the docker storage_opt disk quota "
+                "(HostConfig.StorageOpt.size = <disk_gb>G) is smaller than this "
+                "tool's image; raise its disk_gb in TOOL_SERVE_RESOURCES above the "
+                "image size. Check the node log / `docker events` for the real cause")
     joined = "\n".join(texts)
     # A concrete bridge connect/identity failure is the most specific root cause
     # (the node could not bind the container's source IP, the gateway address was

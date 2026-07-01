@@ -36,6 +36,7 @@ from typing import Any, Dict, List, Optional
 from .attachments import Attachment, materialize_attachments
 from .engine import DavinciAgent, EchoExecutor, ToolResult
 from .mcp import ToolDescriptor, ToolRegistry
+from .result_tool import register_result_tools
 from .observability import Budget, Tracer
 from .permissions import PermissionEngine, PermissionMode, Risk, ToolAction
 
@@ -243,7 +244,9 @@ def _registry_from_tool_catalog(tools: List[Dict[str, Any]]) -> ToolRegistry:
             server="caspar",
             _schema=schema,
         ))
-    return reg
+    # Always add the built-in terminal result tools so the agent can deliver a
+    # typed final answer regardless of which data tools the task supplied.
+    return register_result_tools(reg)
 
 
 def _read_config() -> Dict[str, Any]:
@@ -267,7 +270,7 @@ def _build_registry() -> ToolRegistry:
             from .mcp import ToolRegistry as _TR
             caspar_reg = bootstrap_default_registry(point_catalog=json.loads(catalog_raw))
             if caspar_reg.list_tools():
-                return _TR.from_caspar_registry(caspar_reg)
+                return register_result_tools(_TR.from_caspar_registry(caspar_reg))
         except Exception:
             pass
 
@@ -281,7 +284,7 @@ def _build_registry() -> ToolRegistry:
                                 category="version_control", risk="medium"))
     reg.register(ToolDescriptor("local__vector_search", "Retrieve documents from a vector store",
                                 category="knowledge_retrieval", risk="low"))
-    return reg
+    return register_result_tools(reg)
 
 
 def _capability_snapshot(registry: ToolRegistry) -> Dict[str, Any]:

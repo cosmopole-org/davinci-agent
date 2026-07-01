@@ -29,6 +29,7 @@ from .mcp import ToolDescriptor, ToolRegistry
 from .observability import Budget, Tracer
 from .permissions import Decision, Outcome, PermissionEngine, Risk, ToolAction
 from .planning import Plan, Planner, PlanStep, StepStatus
+from .result_tool import coerce_result_value
 
 
 # ---------------------------------------------------------------------------
@@ -169,6 +170,9 @@ class DavinciAgent:
         # (e.g. LLMReasoner) can attach them to their LLM calls. The
         # deterministic HeuristicReasoner simply ignores them.
         atts = list(attachments or [])
+        # Set when a terminal *result* tool delivers the final answer, so the run
+        # loop stops immediately instead of running further steps or synthesis.
+        self._final_delivered = False
         if atts:
             self.working.set_fact("attachments", atts)
             self.working.remember("user_attachments",
@@ -202,6 +206,10 @@ class DavinciAgent:
                 continue
 
             answer = self._run_step(objective, plan, step, pending_review) or answer
+            if self._final_delivered:
+                # A terminal result tool produced the final, typed answer.
+                self._record("final_answer", "Final answer delivered via result tool")
+                break
 
         success = plan.is_complete and not plan.has_failures and self.budget.exceeded() is None
         # Final answer: prefer a full-context synthesis over the whole run (the
@@ -241,6 +249,24 @@ class DavinciAgent:
             return None
 
         tool = proposal.tool
+
+        # Terminal *result* tool: the model is delivering the final answer. Coerce
+        # its typed ``value`` into the run answer and stop — never dispatch it to a
+        # creature (there is none). A missing/invalid value fails the step so the
+        # run can fall back to end-of-run synthesis.
+        if getattr(tool, "terminal", False):
+            value = coerce_result_value(tool.name, proposal.args)
+            if value is None:
+                plan.fail(step.id, f"{tool.name} called without a valid 'value'")
+                self._record("tool_result", f"{tool.name} missing/invalid value",
+                             step_id=step.id, tool=tool.name, ok=False)
+                return None
+            plan.complete(step.id, value)
+            self.working.remember("assistant", value)
+            self._final_delivered = True
+            self._record("tool_result", f"{tool.name} delivered final answer",
+                         step_id=step.id, tool=tool.name, ok=True, output=value)
+            return value
         action = ToolAction(tool_id=tool.name, category=tool.category,
                             risk=Risk(tool.risk), args=proposal.args,
                             requires_network=tool.requires_network)

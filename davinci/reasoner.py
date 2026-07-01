@@ -112,7 +112,11 @@ class LLMReasoner:
             "\"args\" using the chosen tool's \"arg_schema\" (use those exact property "
             "names and types) — e.g. provide runnable code for a code arg, a real query "
             "string for a query arg. Only fall back to a generic args.task when the tool "
-            "exposes no arg_schema. When the user supplied attachments, they are sent "
+            "exposes no arg_schema. To DELIVER THE FINAL ANSWER (e.g. a \"result\" step, "
+            "or once you have computed the result), pick the terminal tool whose type "
+            "matches the required output — result_as_number / result_as_text / "
+            "result_as_boolean / result_as_json / result_as_list — and put the answer in "
+            "args.value with the correct type; that ends the run. When the user supplied attachments, they are sent "
             "alongside this message as standard multimodal parts — inspect them when the "
             "step needs their content."
         )
@@ -173,7 +177,9 @@ class LLMReasoner:
             "computation — never a vague 'do the research' placeholder). Pick each "
             "step's \"category\" from the provided list so it routes to a matching "
             "tool. Keep it tight (5-9 steps). The LAST step MUST have category "
-            "\"synthesis\" and produce the final answer, honoring any output-format "
+            "\"result\": it delivers the final answer by calling the terminal "
+            "result tool whose type matches the objective's required output "
+            "(e.g. result_as_number for a number), honoring any output-format "
             "constraint stated in the objective. Reply with a single JSON object: "
             "{\"steps\": [{\"title\": str, \"category\": str, \"rationale\": str}, ...]}."
         )
@@ -202,9 +208,11 @@ class LLMReasoner:
             added += 1
         if added == 0:
             return _Planner._heuristic_plan(objective, required_categories)
-        if plan.steps[-1].category != "synthesis":
-            plan.add_step("Synthesize the final answer in the exact required format",
-                          "synthesis", "Aggregate the gathered results into the final answer.")
+        if plan.steps[-1].category not in ("result", "synthesis"):
+            plan.add_step("Deliver the final answer by calling the matching result_as_* "
+                          "terminal tool with the computed value, in the exact required format",
+                          "result", "Submit the typed final answer so it is signalled back "
+                          "to the requester.")
         self._emit("plan", model=self.active_model, steps=added)
         return plan
 

@@ -62,67 +62,362 @@ CMC_TRADER_HANDLE = _after_profile.strip("/").split("/")[0].split("?")[0] or "th
 TASK_OBJECTIVE = (
     f"Today's real-world date is {TODAY:%A, %d %B %Y} (i.e. the current year is "
     f"{_THIS_YEAR}). Use this as your reference 'now' for every date you resolve "
-    "below.\n"
-    "Goal: produce a SINGLE number — the average accuracy score (0–100) of the "
-    "crypto price predictions made by the CoinMarketCap community trader "
-    f"'{CMC_TRADER_HANDLE}'.\n"
-    f"Profile URL: {CMC_PROFILE_URL}\n\n"
-    "Work through these steps in order:\n\n"
-    "1) EXTRACT THE POSTS. The profile is a JavaScript-rendered single-page app, "
-    "so a plain HTTP fetch returns only the empty page shell with no posts. You "
-    "MUST use the browser-automation tool (NOT the static fetch tool) to open "
-    "the profile URL. Give it explicit steps: goto the URL, wait for the page to "
-    "finish loading (wait_for_load_state 'networkidle'), then scroll several "
-    "times with short waits so at least the 10 latest posts load. The browser "
-    "tool always returns the fully rendered, post-JavaScript page text in its "
-    "result's 'final.text' field — the real posts are in there. Read and parse "
-    "the posts straight out of 'final.text'. Do NOT expect raw HTML and do NOT "
-    "treat a page-shell/header as failure; if a CSS selector you guess does not "
-    "match, do NOT abort or fall back to dummy data — just parse 'final.text'. "
-    "Note any chart-screenshot context mentioned in the posts and factor the "
-    "predicted levels into your analysis.\n\n"
-    "2) PARSE EACH PREDICTION. From the 10 latest prediction posts, extract for "
-    "each one: the cryptocurrency (ticker symbol), the predicted price/target, "
-    "and the exact date & time the prediction refers to (the predicting time "
-    "point).\n"
-    "   BE PRECISE ABOUT THE YEAR — this is critical, a wrong year fetches the "
-    "wrong historical price and ruins the score. CoinMarketCap shows the newest "
-    "posts with a SHORT date that has NO year (e.g. 'Jun 26') or as a relative "
-    "time (e.g. '2d ago', 'yesterday', '5h ago'). Resolve every such date "
-    f"against today ({TODAY:%d %B %Y}): a bare 'Mon DD' with no year means that "
-    f"day in {_THIS_YEAR} — take the most recent occurrence that is ON OR BEFORE "
-    "today, and NEVER a future date and NEVER silently assume the previous year. "
-    "Convert any relative time by counting back from today's date. Only when a "
-    "post shows an EXPLICIT year (older posts like the pinned 'Aug 4, 2025') do "
-    "you use that printed year. Normalise each resolved date to day-month-year "
-    "and reuse exactly that date when fetching its historical price in step 3.\n\n"
-    "3) FETCH THE REAL PRICES FROM THE WEB — THIS IS MANDATORY AND MUST BE DONE "
-    "BY ACTUALLY RUNNING CODE. Do NOT skip this, do NOT defer it to a later "
-    "'synthesis' step, and do NOT assume or estimate any price. In THIS step you "
-    "must make a real python-execution tool call whose code uses the 'requests' "
-    "library to call a public historical crypto-price web API over HTTP and read "
-    "the real price that actually happened at each prediction's date/time. "
-    "Concretely, for each (crypto, predicted date/time) pair, query the CoinGecko "
-    "API, e.g. GET "
-    "https://api.coingecko.com/api/v3/coins/{coin_id}/history?date={dd-mm-yyyy} "
-    "(date in day-month-year), and read market_data.current_price.usd from the "
-    "JSON response — map tickers to CoinGecko ids (BTC->bitcoin, ETH->ethereum, "
-    "SOL->solana, XRP->ripple, etc.). If CoinGecko fails or rate-limits, fall "
-    "back to another real endpoint (e.g. the Binance klines API "
-    "https://api.binance.com/api/v3/klines?symbol={SYM}USDT&interval=1d&startTime="
-    "{ms}&limit=1). Collect the real fetched price for every prediction into a "
-    "Python list/dict and PRINT it so the values are captured. Never fabricate a "
-    "price; if a lookup truly fails after retries, mark that prediction's real "
-    "price as unavailable and exclude it.\n\n"
-    "4) SCORE EACH PREDICTION — also by running code in the python-execution "
-    "tool. In a python-execution call, for every prediction compute an accuracy "
-    "score from 0 to 100 comparing the predicted price to the real fetched price, "
-    "as score = max(0, 100 - abs(predicted - real) / real * 100). Build the list "
-    "of individual scores from the REAL fetched prices gathered in step 3.\n\n"
-    "5) AVERAGE & OUTPUT. Compute the mean of all the individual scores (in the "
-    "python-execution tool) and set that as the result. Your final answer MUST be "
-    "ONLY that single number (a value between 0 and 100) and nothing else — no "
-    "words, units, or explanation."
+    """below.\n
+    ROLE
+You are an institutional-grade Financial Intelligence AI specialized in evaluating cryptocurrency and forex analysts.
+Your task is NOT to predict the market.
+Your task is to objectively measure the quality, accuracy, consistency and reliability of analysts based on their published posts and actual market performance.
+Every score must be generated from verifiable market data.
+Never guess.
+If data is insufficient reduce confidence. you can use the browser tool to naviagte the web page. you can use the frtvh tool to fetch api driven data.
+
+naviagte to the trader's coin market cap profile at https://coinmarketcap.com/community/profile/daniel_crypto365/ and do these based on that page:
+
+INPUT
+You receive
+Analyst Information
+username 
+followers 
+platform 
+total posts 
+
+Post
+Each post contains
+text 
+timestamp 
+symbol 
+market 
+images 
+charts 
+timeframe 
+entry 
+stoploss 
+take profits 
+prediction 
+direction 
+confidence (if exists) 
+
+Market Data
+Historical OHLCV
+Real price
+Volume
+Funding Rate
+Open Interest
+Liquidation Data
+CVD
+Whale Transactions
+Exchange Inflow/Outflow
+On-chain Metrics
+Fear & Greed
+News
+Economic Calendar
+CPI
+FOMC
+Interest Rates
+ETF Flows
+DXY
+Gold
+NASDAQ
+Correlation Data
+
+OBJECTIVE
+Generate a complete reliability profile for the analyst.
+Do NOT evaluate writing quality.
+Evaluate analytical performance.
+
+STEP 1
+Classify each post.
+Categories
+Technical Analysis
+Fundamental Analysis
+Mixed
+News
+Educational
+Market Update
+Signal
+Trade Journal
+Macro
+Opinion
+Ignore posts with no prediction.
+
+STEP 2
+Extract prediction.
+Direction
+Bullish
+Bearish
+Neutral
+Range
+Reversal
+Breakout
+Breakdown
+Target
+Stop
+Invalidation
+Time Horizon
+Scalp
+Intraday
+Swing
+Position
+Long Term
+
+STEP 3
+Determine evaluation window.
+If analyst explicitly says
+Next 2 hours
+Use exactly 2 hours.
+If says
+This week
+Evaluate until week ends.
+If says
+Next month
+Evaluate one month.
+If no timeframe
+Estimate from context.
+Confidence decreases.
+
+STEP 4
+Measure actual market outcome.
+Calculate
+Maximum Favorable Excursion
+Maximum Adverse Excursion
+Final Return
+Target Hit
+Stop Hit
+Drawdown
+Volatility
+ATR
+Trend Strength
+Relative Performance
+
+STEP 5
+Technical Analysis Evaluation
+Evaluate
+Trend Analysis
+Support Resistance
+Market Structure
+Supply Demand
+Liquidity
+Order Blocks
+FVG
+Volume
+Volume Profile
+VWAP
+EMA
+SMA
+MACD
+RSI
+Stochastic
+ADX
+Bollinger
+Ichimoku
+Fibonacci
+Wyckoff
+SMC
+Price Action
+Candlestick
+Breakout Quality
+Risk Reward
+Entry Precision
+Stop Placement
+Target Placement
+Probability
+Score each
+0-100
+
+STEP 6
+Fundamental Evaluation
+Evaluate whether the fundamental reasoning was actually reflected in the market.
+Examples
+ETF approval
+Interest rate
+Fed speech
+Inflation
+Whale accumulation
+Token unlock
+Partnership
+Hack
+Exchange listing
+Exchange delisting
+SEC
+Regulation
+Protocol Upgrade
+Burn
+Tokenomics
+On-chain activity
+Developer Activity
+TVL
+Stablecoin Supply
+Liquidity
+Sentiment
+News Impact
+Macro
+Dollar Index
+Gold
+NASDAQ
+Oil
+BTC Dominance
+ETH Dominance
+Funding Rate
+Open Interest
+Liquidations
+Measure
+Expected Impact
+Actual Impact
+Reaction Delay
+Magnitude
+Duration
+Persistence
+Noise
+False Correlation
+Assign score
+0-100
+
+STEP 7
+Prediction Accuracy
+For every prediction calculate
+Correct Direction
+Timing Accuracy
+Entry Accuracy
+Exit Accuracy
+Maximum Profit
+Maximum Loss
+Risk Adjusted Return
+Sharpe-like score
+Precision
+Confidence Calibration
+
+STEP 8
+Consistency
+Measure
+Winning Streak
+Losing Streak
+Monthly Accuracy
+Quarterly Accuracy
+Average Return
+Median Return
+Variance
+Stability
+Prediction Frequency
+Confidence Stability
+
+STEP 9
+Reliability
+Detect
+Cherry Picking
+Deleted Posts
+Edited Posts
+Contradictory Signals
+Clickbait
+Impossible Claims
+Overconfidence
+Prediction Spam
+No Stop Loss
+Always Bullish
+Always Bearish
+If detected
+Decrease score.
+
+STEP 10
+Image Analysis
+Analyze chart.
+Identify
+Trendlines
+Indicators
+Support
+Resistance
+Drawing Quality
+Whether chart actually supports text.
+
+STEP 11
+Historical Performance
+If analyst has many posts
+Calculate
+Last 10
+Last 30
+Last 50
+Last 100
+Lifetime
+Accuracy
+Average Return
+Maximum Drawdown
+Average Holding Time
+
+STEP 12
+Create Scores
+Technical Accuracy
+Technical Quality
+Fundamental Accuracy
+Fundamental Quality
+Risk Management
+Entry Quality
+Exit Quality
+Timing
+Consistency
+Transparency
+Reliability
+Market Understanding
+Signal Strength
+Overall Analyst Score
+All scores
+0-100
+
+STEP 13
+Analyst Rating
+95-100
+Elite Institutional
+90-94
+Professional
+80-89
+Advanced
+70-79
+Intermediate
+60-69
+Average
+40-59
+Weak
+Below 40
+Unreliable
+
+STEP 14
+Confidence
+Every score must include
+Confidence %
+Based on
+Sample Size
+Market Data Completeness
+Prediction Clarity
+Timeframe Clarity
+Historical Coverage
+
+STEP 15
+Final JSON
+{
+  "overall_score":0,
+  "technical_score":0,
+  "fundamental_score":0,
+  "historical_accuracy":0,
+  "consistency":0,
+  "risk_management":0,
+  "timing":0,
+  "confidence":0,
+  "technical_analysis":{
+  },
+  "fundamental_analysis":{
+  },
+  "historical_statistics":{
+  },
+  "market_validation":{
+  },
+  "prediction_validation":{
+  },
+  "strengths":[
+  ],
+  "weaknesses":[
+  ],
+  "warnings":[
+  ]
+}
+"""
 )
 
 TOOL_IDS = ["web_search", "fetch_url", "browser_automation", "python_exec"]

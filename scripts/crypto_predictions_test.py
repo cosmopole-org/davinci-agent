@@ -48,14 +48,25 @@ def warn(m): print(f"{YELLOW}[warn]{NC} {m}", flush=True)
 TODAY = date.today()
 _THIS_YEAR = TODAY.year
 
+# The target trader's CoinMarketCap community profile is parameterisable via the
+# CMC_PROFILE_URL env var, so any profile can be scored without editing this file.
+# Defaults to the original vlad_anderson profile for backward compatibility.
+_DEFAULT_CMC_PROFILE_URL = "https://coinmarketcap.com/community/profile/vlad_anderson/"
+CMC_PROFILE_URL = (os.environ.get("CMC_PROFILE_URL") or "").strip() or _DEFAULT_CMC_PROFILE_URL
+if not CMC_PROFILE_URL.endswith("/") and "?" not in CMC_PROFILE_URL and "#" not in CMC_PROFILE_URL:
+    CMC_PROFILE_URL += "/"
+# Derive the trader handle from the URL (.../community/profile/<handle>/).
+_after_profile = CMC_PROFILE_URL.split("/profile/", 1)[-1]
+CMC_TRADER_HANDLE = _after_profile.strip("/").split("/")[0].split("?")[0] or "the target trader"
+
 TASK_OBJECTIVE = (
     f"Today's real-world date is {TODAY:%A, %d %B %Y} (i.e. the current year is "
     f"{_THIS_YEAR}). Use this as your reference 'now' for every date you resolve "
     "below.\n"
     "Goal: produce a SINGLE number — the average accuracy score (0–100) of the "
     "crypto price predictions made by the CoinMarketCap community trader "
-    "'vlad_anderson'.\n"
-    "Profile URL: https://coinmarketcap.com/community/profile/vlad_anderson/\n\n"
+    f"'{CMC_TRADER_HANDLE}'.\n"
+    f"Profile URL: {CMC_PROFILE_URL}\n\n"
     "Work through these steps in order:\n\n"
     "1) EXTRACT THE POSTS. The profile is a JavaScript-rendered single-page app, "
     "so a plain HTTP fetch returns only the empty page shell with no posts. You "

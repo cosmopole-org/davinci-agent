@@ -50,8 +50,8 @@ _THIS_YEAR = TODAY.year
 
 # The target trader's CoinMarketCap community profile is parameterisable via the
 # CMC_PROFILE_URL env var, so any profile can be scored without editing this file.
-# Defaults to the original vlad_anderson profile for backward compatibility.
-_DEFAULT_CMC_PROFILE_URL = "https://coinmarketcap.com/community/profile/vlad_anderson/"
+# Defaults to the daniel_crypto365 profile the reliability-report prompt targets.
+_DEFAULT_CMC_PROFILE_URL = "https://coinmarketcap.com/community/profile/daniel_crypto365/"
 CMC_PROFILE_URL = (os.environ.get("CMC_PROFILE_URL") or "").strip() or _DEFAULT_CMC_PROFILE_URL
 if not CMC_PROFILE_URL.endswith("/") and "?" not in CMC_PROFILE_URL and "#" not in CMC_PROFILE_URL:
     CMC_PROFILE_URL += "/"
@@ -71,7 +71,9 @@ Every score must be generated from verifiable market data.
 Never guess.
 If data is insufficient reduce confidence. you can use the browser tool to naviagte the web page. you can use the frtvh tool to fetch api driven data.
 
-naviagte to the trader's coin market cap profile at https://coinmarketcap.com/community/profile/daniel_crypto365/ and do these based on that page:
+naviagte to the trader's coin market cap profile at """
+    f"{CMC_PROFILE_URL} and do these based on that page:"
+    """
 
 INPUT
 You receive

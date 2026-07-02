@@ -217,21 +217,47 @@ def invoke(function_name: str, payload: dict) -> dict:
                 ctx_kwargs["user_agent"] = payload["user_agent"]
             if ignore_tls:
                 ctx_kwargs["ignore_https_errors"] = True
-            context = browser.new_context(**ctx_kwargs)
-            context.set_default_timeout(default_timeout)
-            # Authenticated-session support: load cookies (Playwright format) from
-            # the payload or a JSON file baked into the image (BROWSER_COOKIES_FILE,
-            # default /app/cookies.json). A site whose data API is auth-gated only
-            # returns real content for a logged-in session's cookies.
+            # Authenticated-session support. IMPORTANT: many modern SPAs (e.g.
+            # CoinMarketCap's community) key login off a Bearer token kept in
+            # localStorage — NOT cookies. Restoring cookies alone leaves the
+            # browser effectively logged out, so auth-gated profiles resolve to
+            # "This account doesn't exist". We therefore accept a full Playwright
+            # *storage_state* (cookies AND per-origin localStorage) as well as the
+            # legacy plain cookie list.
+            #
+            # Source precedence: payload.storage_state → BROWSER_STORAGE_STATE
+            # file → the cookies source (payload.cookies or BROWSER_COOKIES_FILE,
+            # default /app/cookies.json). The cookies file may itself be either a
+            # bare cookie jar (a JSON list) or a full storage_state (a JSON object
+            # with "cookies"/"origins"); we auto-detect which.
+            storage_state = payload.get("storage_state")
             cookies = payload.get("cookies")
-            if cookies is None:
+            if storage_state is None:
+                ss_path = os.environ.get("BROWSER_STORAGE_STATE", "").strip()
+                if ss_path and os.path.isfile(ss_path):
+                    try:
+                        with open(ss_path) as fh:
+                            storage_state = json.load(fh)
+                    except Exception:
+                        storage_state = None
+            if storage_state is None and cookies is None:
                 cookie_path = os.environ.get("BROWSER_COOKIES_FILE", "/app/cookies.json")
                 if os.path.isfile(cookie_path):
                     try:
                         with open(cookie_path) as fh:
-                            cookies = json.load(fh)
+                            loaded = json.load(fh)
                     except Exception:
-                        cookies = None
+                        loaded = None
+                    if isinstance(loaded, dict) and ("cookies" in loaded or "origins" in loaded):
+                        storage_state = loaded            # full Playwright storage_state
+                    elif isinstance(loaded, list):
+                        cookies = loaded                  # legacy bare cookie jar
+            if isinstance(storage_state, (dict, str)):
+                # Restores cookies + localStorage before any navigation.
+                ctx_kwargs["storage_state"] = storage_state
+            context = browser.new_context(**ctx_kwargs)
+            context.set_default_timeout(default_timeout)
+            # Legacy path: a bare cookie list is applied after context creation.
             if cookies:
                 try:
                     context.add_cookies(cookies)

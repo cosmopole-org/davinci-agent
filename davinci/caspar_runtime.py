@@ -35,6 +35,7 @@ from typing import Any, Dict, List, Optional
 
 from .attachments import Attachment, materialize_attachments
 from .engine import DavinciAgent, EchoExecutor, ToolResult
+from .memory import InstructionMemory
 from .mcp import ToolDescriptor, ToolRegistry
 from .result_tool import register_result_tools
 from .observability import Budget, Tracer
@@ -318,9 +319,25 @@ def _run_agent(bridge: Any, task: Dict[str, Any], config: Dict[str, Any],
     *with the task* over the signaling API; nothing is read from a task file in
     the gateway path.
     """
-    objective = task.get("objective") or "Run a self-test and report Davinci capabilities."
+    objective = (task.get("objective")
+                 or task.get("prompt")
+                 or (task.get("data") if isinstance(task.get("data"), str) else None)
+                 or "Run a self-test and report Davinci capabilities.")
     required = task.get("required_categories") or []
     tools = config.get("tools") or []
+
+    # Skill delivered with the task (a Caspar proxy "agent" entity attaches
+    # its deployed skill file under ``skill``): loaded as this session's
+    # system instruction, layered on top of the DAVINCI.md hierarchy.
+    skill_text = task.get("skill") or task.get("systemInstruction") or ""
+    instructions = None
+    if isinstance(skill_text, str) and skill_text.strip():
+        instructions = InstructionMemory().discover(os.getcwd())
+        instructions.add_inline(skill_text, source="caspar-agent-skill")
+        print("DAVINCI_SKILL " + json.dumps(
+            {"chars": len(skill_text),
+             "proxy": task.get("proxyProgramId", ""),
+             "entity": task.get("proxyEntityId", "")}), flush=True)
 
     executor: Any = EchoExecutor()
     discovery = "none"
@@ -399,6 +416,7 @@ def _run_agent(bridge: Any, task: Dict[str, Any], config: Dict[str, Any],
         reasoner=reasoner,  # None -> engine default (HeuristicReasoner)
         executor=executor,
         planner=planner,    # None -> engine default (deterministic Planner)
+        instructions=instructions,  # None -> engine default (DAVINCI.md only)
         tracer=tracer,
         budget=Budget(
             max_steps=int(config.get("max_steps")
@@ -451,12 +469,46 @@ def _wait_for_task_signal(bridge: Any, timeout: float) -> tuple:
                 return
         if not isinstance(inner, dict):
             inner = data
-        # Only act on a task delivery, not on unrelated signals.
-        if inner.get("kind") != "task" and "objective" not in inner:
+        # Client convention: the requester's real payload may travel as a
+        # JSON string under ``payload`` ({programId, entity, payload:"…"}).
+        # Unwrap it into the task, keeping the proxy envelope keys (skill,
+        # correlationId, replyTo, proxy*) the node stamped on the wrapper.
+        wrapped = inner.get("payload")
+        if isinstance(wrapped, str) and wrapped.strip():
+            try:
+                parsed_payload = json.loads(wrapped)
+            except Exception:  # noqa: BLE001 — plain-text prompt
+                parsed_payload = {"objective": wrapped}
+            if isinstance(parsed_payload, dict):
+                merged = dict(parsed_payload)
+                for k in ("skill", "systemInstruction", "correlationId",
+                          "replyTo", "reply_to", "proxyProgramId",
+                          "proxyEntityId"):
+                    if k in inner and k not in merged:
+                        merged[k] = inner[k]
+                inner = merged
+        elif isinstance(wrapped, dict):
+            merged = dict(wrapped)
+            for k in ("skill", "systemInstruction", "correlationId",
+                      "replyTo", "reply_to", "proxyProgramId",
+                      "proxyEntityId"):
+                if k in inner and k not in merged:
+                    merged[k] = inner[k]
+            inner = merged
+        # Only act on a task delivery, not on unrelated signals. A packet
+        # relayed by a Caspar proxy "agent" entity carries the deployed skill
+        # file (``skill``) — that is a task too, even when the requester only
+        # sent a bare prompt/data string.
+        if (inner.get("kind") != "task" and "objective" not in inner
+                and "skill" not in inner):
             return
         box["task"] = inner
-        box["reply_to"] = inner.get("reply_to") or (data.get("user") or {}).get("id")
-        box["correlationId"] = inner.get("correlationId")
+        # ``replyTo`` is stamped by the node's proxy forwarding so the result
+        # goes back through the proxy entity (which relays it to the original
+        # sender under the proxy's identity, matching the correlation id).
+        box["reply_to"] = (inner.get("reply_to") or inner.get("replyTo")
+                           or (data.get("user") or {}).get("id"))
+        box["correlationId"] = inner.get("correlationId") or data.get("correlationId")
         ev.set()
 
     bridge.on_signal(on_signal)

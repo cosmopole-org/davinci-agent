@@ -469,6 +469,32 @@ def _wait_for_task_signal(bridge: Any, timeout: float) -> tuple:
                 return
         if not isinstance(inner, dict):
             inner = data
+        # Client convention: the requester's real payload may travel as a
+        # JSON string under ``payload`` ({programId, entity, payload:"…"}).
+        # Unwrap it into the task, keeping the proxy envelope keys (skill,
+        # correlationId, replyTo, proxy*) the node stamped on the wrapper.
+        wrapped = inner.get("payload")
+        if isinstance(wrapped, str) and wrapped.strip():
+            try:
+                parsed_payload = json.loads(wrapped)
+            except Exception:  # noqa: BLE001 — plain-text prompt
+                parsed_payload = {"objective": wrapped}
+            if isinstance(parsed_payload, dict):
+                merged = dict(parsed_payload)
+                for k in ("skill", "systemInstruction", "correlationId",
+                          "replyTo", "reply_to", "proxyProgramId",
+                          "proxyEntityId"):
+                    if k in inner and k not in merged:
+                        merged[k] = inner[k]
+                inner = merged
+        elif isinstance(wrapped, dict):
+            merged = dict(wrapped)
+            for k in ("skill", "systemInstruction", "correlationId",
+                      "replyTo", "reply_to", "proxyProgramId",
+                      "proxyEntityId"):
+                if k in inner and k not in merged:
+                    merged[k] = inner[k]
+            inner = merged
         # Only act on a task delivery, not on unrelated signals. A packet
         # relayed by a Caspar proxy "agent" entity carries the deployed skill
         # file (``skill``) — that is a task too, even when the requester only

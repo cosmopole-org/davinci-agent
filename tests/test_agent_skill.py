@@ -83,3 +83,24 @@ def test_run_agent_without_skill_keeps_default_instructions():
     with redirect_stdout(buf):
         rt._run_agent(None, {"objective": "self-test"}, {}, [])
     assert "DAVINCI_SKILL" not in buf.getvalue()
+
+
+def test_wait_for_task_unwraps_client_payload_wrapper():
+    # CLI convention: {programId, entity, payload:"<json>"} with the skill
+    # and correlation envelope stamped on the wrapper by the node's proxy.
+    packet = {
+        "user": {"id": "proxy-prog"},
+        "data": (
+            '{"programId":"p1","entity":"agent",'
+            '"payload":"{\\"objective\\":\\"draft the changelog\\",\\"correlationId\\":\\"cli-7\\"}",'
+            '"skill":"Changelog skill.","correlationId":"cli-7","replyTo":"proxy-prog"}'
+        ),
+    }
+    with redirect_stdout(io.StringIO()):
+        task, reply_to, corr = rt._wait_for_task_signal(
+            _SignalOnRegisterBridge(packet), timeout=1)
+    assert task is not None
+    assert task["objective"] == "draft the changelog"
+    assert task["skill"] == "Changelog skill."
+    assert reply_to == "proxy-prog"
+    assert corr == "cli-7"

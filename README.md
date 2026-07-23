@@ -37,7 +37,7 @@ Implemented in the `davinci/` package (stdlib-only, runs in a slim container):
 | Area | Capability | Module |
 |------|-----------|--------|
 | Reasoning | plan-and-execute · ReAct · reflection · replan-on-failure · stuck/loop detection | `engine.py`, `planning.py` |
-| LLM backbone | **provider-agnostic** reasoning/planning/loop · pluggable clients (Gemini · Anthropic/Claude · OpenAI · Grok · any OpenAI-compatible) · multi-model fallback | `reasoner.py`, `llm.py` |
+| LLM backbone | **provider-agnostic** reasoning/planning/loop · pluggable clients (Gemini · Anthropic/Claude · OpenAI · Grok · OpenRouter · any OpenAI-compatible) · multi-model fallback | `reasoner.py`, `llm.py` |
 | Permissions | risk tiers (low/med/high) · 6 permission modes · deny-first rules · input **and** output guardrails | `permissions.py` |
 | Limits | bounded execution (steps/tool-calls) · token + cost budget · wall-clock deadline | `observability.py` |
 | Memory | working memory · event-sourced JSONL episodic log (replay/resume) · hierarchical `DAVINCI.md` instructions · context compaction | `memory.py` |
@@ -62,10 +62,27 @@ Davinci's tools are deployed as **separate Caspar `docker` creatures**, and the
 Davinci creature interacts with them purely through the Caspar **signalling API**.
 The agent's reasoning is driven by a **pluggable LLM backbone** — the same
 reasoning/planning/loop algorithms run on **Gemini**, **Anthropic (Claude)**,
-**OpenAI**, **Grok (xAI)**, or any OpenAI-compatible endpoint. Pick the provider
-in the task config (`llm_provider` / `<provider>_api_key`, or an `llm` block);
-Gemini is the default when only a Gemini key is supplied. The examples below pass
-a Gemini key, but any provider's key works the same way.
+**OpenAI**, **Grok (xAI)**, **OpenRouter**, or any OpenAI-compatible endpoint.
+Pick the provider in the task config (`llm_provider` / `<provider>_api_key`, or
+an `llm` block); Gemini is the default when only a Gemini key is supplied. The
+examples below pass a Gemini key, but any provider's key works the same way.
+
+To use **OpenRouter** (an OpenAI-compatible aggregator that fronts hundreds of
+models), just set three environment variables — no config file needed:
+
+```bash
+export LLM_PROVIDER=openrouter
+export OPENROUTER_API_KEY="<your OpenRouter key>"
+export OPENROUTER_MODEL="anthropic/claude-sonnet-4.6"   # any vendor/model slug
+# optional app-ranking attribution headers:
+#   export OPENROUTER_SITE_URL="https://your.site"
+#   export OPENROUTER_SITE_NAME="Your App"
+```
+
+The model slug is namespaced `vendor/model` (e.g. `openai/gpt-4o`,
+`google/gemini-2.5-flash`). For multi-model fallback, pass a comma-separated
+list via the `openrouter_models` config value (or an `llm` block's `models`);
+`OPENROUTER_MODEL` selects a single model.
 
 ### One-command end-to-end workflow (recommended)
 
@@ -213,7 +230,7 @@ davinci/                 # the agent runtime package
   observability.py       # tracer, budget, secret masking
   mcp.py                 # MCP-style tool registry
   reasoner.py            # provider-agnostic LLMReasoner (shared reasoning logic)
-  llm.py                 # cross-LLM clients: Gemini · Anthropic · OpenAI · Grok
+  llm.py                 # cross-LLM clients: Gemini · Anthropic · OpenAI · Grok · OpenRouter
   caspar_signaling.py    # Caspar TCP client (RSA-PSS signing)
   caspar_runtime.py      # docker-creature entrypoint (live signalling)
   caspar_executor.py     # signal pre-running Caspar tool VMs

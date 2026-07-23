@@ -19,6 +19,7 @@ from davinci.llm import (  # noqa: E402
     GrokClient,
     LLMClient,
     OpenAIClient,
+    OpenRouterClient,
     client_from_config,
     make_client,
 )
@@ -38,6 +39,7 @@ def test_auto_detects_each_provider_from_its_key():
     assert client_from_config({"openai_api_key": "k"}).provider == "openai"
     assert client_from_config({"grok_api_key": "k"}).provider == "grok"
     assert client_from_config({"xai_api_key": "k"}).provider == "grok"
+    assert client_from_config({"openrouter_api_key": "k"}).provider == "openrouter"
 
 
 def test_explicit_provider_name_wins_over_other_keys():
@@ -57,9 +59,18 @@ def test_no_key_yields_no_client_and_no_reasoner():
     assert reasoner_from_config({}) is None
 
 
+def test_openrouter_selection_from_provider_name_and_model_config():
+    cfg = {"llm_provider": "openrouter", "openrouter_api_key": "k",
+           "openrouter_models": "anthropic/claude-sonnet-4.6"}
+    client = client_from_config(cfg)
+    assert client.provider == "openrouter"
+    assert client.models == ["anthropic/claude-sonnet-4.6"]
+
+
 def test_make_client_aliases_and_unknown():
     assert make_client("google", "k").provider == "gemini"
     assert make_client("gpt", "k").provider == "openai"
+    assert make_client("openrouter.ai", "k").provider == "openrouter"
     try:
         make_client("llama", "k")
     except ValueError:
@@ -104,7 +115,8 @@ def test_anthropic_request_omits_sampling_and_uses_headers():
 
 
 def test_openai_compatible_request_and_response():
-    for cls, host in [(OpenAIClient, "api.openai.com"), (GrokClient, "api.x.ai")]:
+    for cls, host in [(OpenAIClient, "api.openai.com"), (GrokClient, "api.x.ai"),
+                      (OpenRouterClient, "openrouter.ai")]:
         url, body, headers = _build(cls("k"))
         assert host in url and url.endswith("/chat/completions")
         assert headers["Authorization"] == "Bearer k"
@@ -112,6 +124,18 @@ def test_openai_compatible_request_and_response():
         assert body["response_format"] == {"type": "json_object"}
         text = cls("k")._extract_text({"choices": [{"message": {"content": "ok"}}]})
         assert text == "ok"
+
+
+def test_openrouter_optional_attribution_headers():
+    # Absent by default …
+    _url, _body, headers = _build(OpenRouterClient("k"))
+    assert "HTTP-Referer" not in headers and "X-Title" not in headers
+    # … present when configured.
+    client = OpenRouterClient("k", site_url="https://davinci.example",
+                              site_name="Davinci")
+    _url, _body, headers = _build(client)
+    assert headers["HTTP-Referer"] == "https://davinci.example"
+    assert headers["X-Title"] == "Davinci"
 
 
 # --------------------------------------------------------------------------- #

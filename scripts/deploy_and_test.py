@@ -94,6 +94,32 @@ def llm_config() -> dict:
                 cfg[f"{LLM_PROVIDER}_models"] = models
     return cfg
 
+
+def llm_bake_env() -> dict:
+    """The LLM backbone as **environment variables** to bake into a creature image.
+
+    Same selection as :func:`llm_config` but keyed by the provider env-var names
+    (``GEMINI_API_KEY``, ``LLM_PROVIDER``, ``<PROVIDER>_API_KEY`` …) so the
+    deployed davinci creature reasons with a real provider without the caller
+    supplying an LLM config on each signal. Read from this harness's environment
+    only; empty when no key is set.
+    """
+    env: dict = {}
+    if GEMINI_API_KEY:
+        env["GEMINI_API_KEY"] = GEMINI_API_KEY
+        if GEMINI_MODELS:
+            env["GEMINI_MODELS"] = ",".join(GEMINI_MODELS)
+    if LLM_PROVIDER in _PROVIDER_ENVS:
+        key_env, models_env = _PROVIDER_ENVS[LLM_PROVIDER]
+        key = os.environ.get(key_env, "").strip()
+        if key:
+            env["LLM_PROVIDER"] = LLM_PROVIDER
+            env[key_env] = key
+            models = os.environ.get(models_env, "").strip()
+            if models:
+                env[models_env] = models
+    return env
+
 # In hardened environments outbound HTTPS is intercepted by an egress gateway
 # whose CA must be trusted inside the creature containers (otherwise Gemini /
 # web tools fail TLS verification). We ship the host CA bundle into each image.
@@ -375,7 +401,28 @@ def signal_tool(c: CasparSignalingClient, rec: dict) -> bool:
     return False
 
 
-def deploy_davinci(c: CasparSignalingClient) -> dict:
+def _bake_env_snippet(env: dict) -> str:
+    """A Dockerfile ``ENV`` line baking key=value pairs into the creature image.
+
+    Used to embed the LLM backbone credentials (e.g. ``GEMINI_API_KEY``) into the
+    davinci agent creature so it reasons with a real provider even when the
+    *caller* (the Decillion backend proxy) signals it without an LLM config —
+    ``client_from_config`` falls back to these env vars. The value never touches
+    disk on the host and never leaves the node's local image store.
+    """
+    if not env:
+        return ""
+    parts = []
+    for k, v in env.items():
+        if v is None or str(v) == "":
+            continue
+        # Quote the value; escape backslashes and double-quotes for Dockerfile ENV.
+        sv = str(v).replace("\\", "\\\\").replace('"', '\\"')
+        parts.append(f'{k}="{sv}"')
+    return ("ENV " + " ".join(parts) + "\n") if parts else ""
+
+
+def deploy_davinci(c: CasparSignalingClient, bake_env: dict = None) -> dict:
     machine_id = c.create_machine_creature(f"m-davinci-agent-{RUN_TAG}")
     program_id = c.create_program(machine_id, "/davinci", "docker", "davinci agent")
     files = {"bundle.tar": b64_bytes(davinci_bundle_tar())}
@@ -384,6 +431,7 @@ def deploy_davinci(c: CasparSignalingClient) -> dict:
     if ca is not None:
         files["ca-certificates.crt"] = b64_bytes(ca)
         dockerfile = dockerfile + CA_DOCKERFILE_SNIPPET
+    dockerfile = dockerfile + _bake_env_snippet(bake_env or {})
     c.deploy(program_id, "davinci", "docker", b64_bytes(dockerfile.encode()), files_b64=files)
     if not wait_for_image(program_id, "davinci", timeout=360):
         raise RuntimeError("davinci image not built in time")

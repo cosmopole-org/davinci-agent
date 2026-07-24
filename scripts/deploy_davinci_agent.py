@@ -29,7 +29,8 @@ runEntity (standalone VM) knobs:
     DAVINCI_VM_RAM_MB      VM RAM in MB        (default 512)
     DAVINCI_VM_DISK_GB     VM disk in GB       (default 1)
     DAVINCI_VM_CPUS        VM CPU cores        (default 1)
-    DAVINCI_VM_MAX_SECONDS VM max exec seconds (default 3600)
+    DAVINCI_VM_MAX_SECONDS VM max exec seconds (default 3600; 0/unlimited/immortal
+                           => ~317y, since the node has no true-unlimited cap)
 
 Output (stdout, machine-readable — the caller greps these):
     DAVINCI_PROGRAM_ID=<id>
@@ -46,6 +47,25 @@ from davinci.caspar_signaling import CasparSignalingClient  # noqa: E402
 
 def _truthy(val: str) -> bool:
     return str(val).strip().lower() not in ("", "0", "false", "no", "off")
+
+
+# The node has no true "unlimited" exec cap: /programs/runEntity clamps
+# maxExecTimeSeconds <= 0 to 60, and the docker VM controller always spawns a
+# reaper that stops the container after that many seconds. So "unlimited" is
+# expressed as a very large (but i64/u64-safe) value — ~317 years — which the
+# reaper effectively never reaches.
+_VM_MAX_UNLIMITED = 10_000_000_000
+
+
+def _vm_max_seconds() -> int:
+    raw = os.environ.get("DAVINCI_VM_MAX_SECONDS", "3600").strip().lower()
+    if raw in ("0", "-1", "none", "inf", "infinite", "unlimited", "immortal", "forever"):
+        return _VM_MAX_UNLIMITED
+    try:
+        val = int(raw)
+    except ValueError:
+        return 3600
+    return _VM_MAX_UNLIMITED if val <= 0 else val
 
 
 def main() -> int:
@@ -77,9 +97,10 @@ def main() -> int:
         ram = int(os.environ.get("DAVINCI_VM_RAM_MB", "512"))
         disk = int(os.environ.get("DAVINCI_VM_DISK_GB", "1"))
         cpus = int(os.environ.get("DAVINCI_VM_CPUS", "1"))
-        max_s = int(os.environ.get("DAVINCI_VM_MAX_SECONDS", "3600"))
+        max_s = _vm_max_seconds()
+        max_label = "unlimited (~317y)" if max_s == _VM_MAX_UNLIMITED else f"{max_s}s"
         dt.info(f"starting davinci as a standalone VM entity via runEntity "
-                f"(ram={ram}MB disk={disk}GB cpu={cpus} maxExec={max_s}s)")
+                f"(ram={ram}MB disk={disk}GB cpu={cpus} maxExec={max_label})")
         try:
             vm_id = c.run_entity(davinci["program_id"], davinci["entity_id"],
                                  ram_mb=ram, disk_gb=disk, cpu_cores=cpus,

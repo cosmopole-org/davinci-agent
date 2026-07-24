@@ -35,8 +35,9 @@ runEntity (standalone VM) knobs:
     DAVINCI_VM_RAM_MB      VM RAM in MB        (default 512)
     DAVINCI_VM_DISK_GB     VM disk in GB       (default 1)
     DAVINCI_VM_CPUS        VM CPU cores        (default 1)
-    DAVINCI_VM_MAX_SECONDS VM max exec seconds (default 3600; 0/unlimited/immortal
-                           => ~317y, since the node has no true-unlimited cap)
+    DAVINCI_VM_MAX_SECONDS VM max exec seconds (default UNLIMITED => ~317y, since
+                           the node has no true-unlimited cap; set a positive
+                           integer to impose a finite cap)
 
 Output (stdout, machine-readable — the caller greps these):
     DAVINCI_PROGRAM_ID=<id>
@@ -64,13 +65,16 @@ _VM_MAX_UNLIMITED = 10_000_000_000
 
 
 def _vm_max_seconds() -> int:
-    raw = os.environ.get("DAVINCI_VM_MAX_SECONDS", "3600").strip().lower()
+    # Unlimited by default: the standalone davinci VM the deploy fires is meant to
+    # be a persistent, always-warm agent, so it should never be time-reaped unless
+    # the operator explicitly sets a finite DAVINCI_VM_MAX_SECONDS.
+    raw = os.environ.get("DAVINCI_VM_MAX_SECONDS", "unlimited").strip().lower()
     if raw in ("0", "-1", "none", "inf", "infinite", "unlimited", "immortal", "forever"):
         return _VM_MAX_UNLIMITED
     try:
         val = int(raw)
     except ValueError:
-        return 3600
+        return _VM_MAX_UNLIMITED
     return _VM_MAX_UNLIMITED if val <= 0 else val
 
 

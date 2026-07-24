@@ -453,51 +453,22 @@ class GrokClient(OpenAICompatibleClient):
 
 
 class OpenRouterClient(OpenAICompatibleClient):
-    """OpenRouter (openrouter.ai) — an OpenAI-compatible aggregator.
+    """OpenRouter (openrouter.ai) — a unified OpenAI-compatible gateway to many
+    providers' models.
 
-    OpenRouter exposes hundreds of models from many vendors behind a single
-    OpenAI-style ``/chat/completions`` endpoint, so it is a drop-in subclass of
-    :class:`OpenAICompatibleClient` — same wire format, ``Bearer`` auth, and
-    ``image_url`` multimodal parts. Switching Davinci to OpenRouter is a config
-    change only: set ``llm_provider=openrouter``, supply the key via
-    ``OPENROUTER_API_KEY`` (or an ``openrouter_api_key`` config value), and pick
-    the model with ``OPENROUTER_MODEL`` / ``openrouter_models``.
-
-    OpenRouter models are namespaced ``vendor/model`` (e.g. ``openai/gpt-4o``,
-    ``anthropic/claude-sonnet-4.6``, ``google/gemini-2.5-flash``). There is no
-    single "right" default across such a catalogue, so the fallback chain below
-    is only a last resort — callers are expected to name the model they want.
-
-    OpenRouter also accepts two *optional* attribution headers,
-    ``HTTP-Referer`` and ``X-Title``, used for its public app-ranking board.
-    They are sent when ``OPENROUTER_SITE_URL`` / ``OPENROUTER_SITE_NAME`` (or
-    the matching config values) are set, and omitted otherwise.
+    Same ``/chat/completions`` wire format and ``Authorization: Bearer`` auth as
+    OpenAI, so it only needs a different base URL. Model ids are namespaced
+    (e.g. ``openai/gpt-4o``, ``anthropic/claude-3.5-sonnet``,
+    ``meta-llama/llama-3.1-70b-instruct``); ``openrouter/auto`` lets OpenRouter
+    pick. Select it with ``llm_provider=openrouter`` + ``OPENROUTER_API_KEY``
+    (and ``OPENROUTER_MODEL`` / ``OPENROUTER_MODELS`` to name a model).
 
     Docs: https://openrouter.ai/docs
     """
 
     provider = "openrouter"
     BASE_URL = "https://openrouter.ai/api/v1"
-    # Namespaced defaults; overridden in practice by OPENROUTER_MODEL / config.
-    DEFAULT_MODELS = ["openai/gpt-4o-mini"]
-
-    def __init__(self, api_key: str, *, site_url: str = "", site_name: str = "",
-                 **kw: Any) -> None:
-        super().__init__(api_key, **kw)
-        self.site_url = (site_url
-                         or os.environ.get("OPENROUTER_SITE_URL", "")).strip()
-        self.site_name = (site_name
-                          or os.environ.get("OPENROUTER_SITE_NAME", "")).strip()
-
-    def _build_request(self, model, system, prompt, attachments, response_json):
-        url, payload, headers = super()._build_request(
-            model, system, prompt, attachments, response_json)
-        # Optional OpenRouter app-attribution headers (ignored if unset).
-        if self.site_url:
-            headers["HTTP-Referer"] = self.site_url
-        if self.site_name:
-            headers["X-Title"] = self.site_name
-        return url, payload, headers
+    DEFAULT_MODELS = ["openrouter/auto"]
 
 
 class AgentRouterClient(AnthropicClient):

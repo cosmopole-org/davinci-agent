@@ -67,6 +67,7 @@ _PROVIDER_ENVS = {
     "openai":      ("OPENAI_API_KEY",      "OPENAI_MODELS"),
     "grok":        ("GROK_API_KEY",        "GROK_MODELS"),
     "agentrouter": ("AGENTROUTER_API_KEY", "AGENTROUTER_MODELS"),
+    "openrouter":  ("OPENROUTER_API_KEY",  "OPENROUTER_MODELS"),
 }
 
 
@@ -115,9 +116,19 @@ def llm_bake_env() -> dict:
         if key:
             env["LLM_PROVIDER"] = LLM_PROVIDER
             env[key_env] = key
+            # Bake the model. The runtime resolves it from either the plural
+            # <PROVIDER>_MODELS or the singular <PROVIDER>_MODEL env var, so carry
+            # whichever the operator set — and derive the singular from the plural
+            # (reasoner_from_config reads the singular from the environment).
+            model_env = f"{LLM_PROVIDER.upper()}_MODEL"
             models = os.environ.get(models_env, "").strip()
+            single = os.environ.get(model_env, "").strip()
             if models:
                 env[models_env] = models
+            if single:
+                env[model_env] = single
+            elif models:
+                env[model_env] = models.split(",")[0].strip()
     return env
 
 # In hardened environments outbound HTTPS is intercepted by an egress gateway

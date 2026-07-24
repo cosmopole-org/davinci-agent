@@ -452,6 +452,25 @@ class GrokClient(OpenAICompatibleClient):
     DEFAULT_MODELS = ["grok-2-latest", "grok-2-vision-latest"]
 
 
+class OpenRouterClient(OpenAICompatibleClient):
+    """OpenRouter (openrouter.ai) — a unified OpenAI-compatible gateway to many
+    providers' models.
+
+    Same ``/chat/completions`` wire format and ``Authorization: Bearer`` auth as
+    OpenAI, so it only needs a different base URL. Model ids are namespaced
+    (e.g. ``openai/gpt-4o``, ``anthropic/claude-3.5-sonnet``,
+    ``meta-llama/llama-3.1-70b-instruct``); ``openrouter/auto`` lets OpenRouter
+    pick. Select it with ``llm_provider=openrouter`` + ``OPENROUTER_API_KEY``
+    (and ``OPENROUTER_MODEL`` / ``OPENROUTER_MODELS`` to name a model).
+
+    Docs: https://openrouter.ai/docs
+    """
+
+    provider = "openrouter"
+    BASE_URL = "https://openrouter.ai/api/v1"
+    DEFAULT_MODELS = ["openrouter/auto"]
+
+
 class AgentRouterClient(AnthropicClient):
     """AgentRouter (agentrouter.org) — a free Anthropic-compatible proxy.
 
@@ -499,6 +518,7 @@ PROVIDERS: Dict[str, Tuple[type, List[str], List[str]]] = {
     "grok":        (GrokClient,          ["grok_api_key", "xai_api_key"],
                                                                       ["GROK_API_KEY", "XAI_API_KEY"]),
     "agentrouter": (AgentRouterClient,   ["agentrouter_api_key"],     ["AGENTROUTER_API_KEY"]),
+    "openrouter":  (OpenRouterClient,    ["openrouter_api_key"],      ["OPENROUTER_API_KEY"]),
 }
 
 #: friendly aliases users might pass for ``llm_provider``.
@@ -508,6 +528,7 @@ PROVIDER_ALIASES = {
     "openai": "openai", "gpt": "openai", "chatgpt": "openai",
     "grok": "grok", "xai": "grok", "x.ai": "grok",
     "agentrouter": "agentrouter", "agent_router": "agentrouter", "agentrouter.org": "agentrouter",
+    "openrouter": "openrouter", "open_router": "openrouter", "openrouter.ai": "openrouter",
 }
 
 
@@ -592,7 +613,7 @@ def client_from_config(config: Dict[str, Any]) -> Optional[LLMClient]:
 
     # 3. auto-detect: first provider that has a key. Gemini first for
     #    backward compatibility with existing deployments.
-    for provider in ("gemini", "anthropic", "openai", "grok", "agentrouter"):
+    for provider in ("gemini", "anthropic", "openai", "grok", "agentrouter", "openrouter"):
         api_key = _api_key_for(provider, config)
         if api_key:
             return make_client(provider, api_key, models=_models_for(provider, config))

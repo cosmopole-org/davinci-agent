@@ -25,9 +25,17 @@ import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
 try:  # signing is only needed for authenticated external calls
-    from Crypto.PublicKey import RSA
-    from Crypto.Signature import pss
-    from Crypto.Hash import SHA256
+    # pip's `pycryptodome` exposes the `Crypto` namespace; the Debian/Ubuntu
+    # apt package `python3-pycryptodome` installs the identical API under
+    # `Cryptodome`. Accept either so the client works with whichever is present.
+    try:
+        from Crypto.PublicKey import RSA
+        from Crypto.Signature import pss
+        from Crypto.Hash import SHA256
+    except Exception:
+        from Cryptodome.PublicKey import RSA
+        from Cryptodome.Signature import pss
+        from Cryptodome.Hash import SHA256
     _HAVE_CRYPTO = True
 except Exception:  # pragma: no cover - exercised only without the dep
     _HAVE_CRYPTO = False

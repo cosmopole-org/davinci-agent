@@ -18,6 +18,12 @@ After deploying, it also starts the agent as a standalone running VM entity on
 Caspar via the runEntity endpoint (so it is live and serving signals, not just
 deployed). Disable with DAVINCI_RUN_ENTITY=0.
 
+The started VM serves prompts persistently: caspar_runtime stays in a serve loop
+(DAVINCI_SERVE_FOREVER, default on) handling every task signal until the node's
+exec cap reaps it, and the node routes each backend prompt to the live VM
+(push_signal_to_machine) instead of cold-spawning — so one warm agent handles
+all prompts. Pair with DAVINCI_VM_MAX_SECONDS=unlimited for a never-reaped VM.
+
 Connection (plaintext TCP, matching the casparctl local node):
     CASPAR_NODE_HOST   node host   (default 127.0.0.1)
     CASPAR_NODE_PORT   node TCP    (default 8074)

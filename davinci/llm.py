@@ -470,6 +470,24 @@ class OpenRouterClient(OpenAICompatibleClient):
     BASE_URL = "https://openrouter.ai/api/v1"
     DEFAULT_MODELS = ["openrouter/auto"]
 
+    def __init__(self, api_key: str, *, site_url: str = "", site_name: str = "",
+                 **kw: Any) -> None:
+        super().__init__(api_key, **kw)
+        # Optional app-attribution headers OpenRouter uses for its rankings
+        # (https://openrouter.ai/docs/app-attribution). From kwargs or the
+        # OPENROUTER_SITE_URL / OPENROUTER_SITE_NAME env; omitted when unset.
+        self.site_url = (site_url or os.environ.get("OPENROUTER_SITE_URL", "")).strip()
+        self.site_name = (site_name or os.environ.get("OPENROUTER_SITE_NAME", "")).strip()
+
+    def _build_request(self, model, system, prompt, attachments, response_json):
+        url, body, headers = super()._build_request(
+            model, system, prompt, attachments, response_json)
+        if self.site_url:
+            headers["HTTP-Referer"] = self.site_url
+        if self.site_name:
+            headers["X-Title"] = self.site_name
+        return url, body, headers
+
 
 class AgentRouterClient(AnthropicClient):
     """AgentRouter (agentrouter.org) — a free Anthropic-compatible proxy.

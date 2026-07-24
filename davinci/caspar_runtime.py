@@ -45,6 +45,14 @@ from .permissions import PermissionEngine, PermissionMode, Risk, ToolAction
 INPUT_DIR = os.environ.get("DAVINCI_INPUT_DIR", "/app/input")
 
 
+def _env_flag(name: str, *, default: bool) -> bool:
+    """Read a boolean env var; unset -> ``default``."""
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    return raw.strip().lower() not in ("0", "false", "no", "off")
+
+
 # --------------------------------------------------------------------------- #
 # Session sandbox lifecycle
 #
@@ -541,35 +549,60 @@ def main(argv: Optional[List[str]] = None) -> int:
             "connected": True, "session": bridge.session_id,
             "vm_id": os.environ.get("CASPAR_VM_ID", ""),
             "machine_id": getattr(bridge, "machine_id", "")}), flush=True)
-        task, reply_to, correlation_id = _wait_for_task_signal(
-            bridge, float(os.environ.get("DAVINCI_TASK_WAIT", "600")))
-        if not task:
-            print("DAVINCI_RESULT " + json.dumps(
-                {"success": False, "error": "no task signal received within wait window"}), flush=True)
+        # Serve mode (default): stay alive and handle every task signal that
+        # arrives over the gateway, one at a time, until the node's exec cap reaps
+        # the VM. This is what lets a run_entity-started davinci be a persistent,
+        # reusable agent instead of a one-shot task processor. Set
+        # DAVINCI_SERVE_FOREVER=0 for the legacy handle-one-then-exit behavior.
+        serve_forever = _env_flag("DAVINCI_SERVE_FOREVER", default=True)
+        idle_wait = float(os.environ.get("DAVINCI_TASK_WAIT", "600"))
+        served = 0
+        try:
+            while True:
+                # ``on_signal`` is a single handler that _run_agent's executor
+                # overwrites while a task runs, so we (re-)register the task
+                # capturer each loop. davinci serves prompts sequentially — the
+                # backend awaits each reply before sending the next — so this
+                # cannot drop an in-flight request.
+                task, reply_to, correlation_id = _wait_for_task_signal(bridge, idle_wait)
+                if not task:
+                    if serve_forever:
+                        print("DAVINCI_IDLE " + json.dumps(
+                            {"served": served, "waited_s": idle_wait, "ts": time.time()}), flush=True)
+                        continue  # immortal: keep waiting for the next task
+                    print("DAVINCI_RESULT " + json.dumps(
+                        {"success": False, "error": "no task signal received within wait window"}), flush=True)
+                    return 2
+                config = task.get("config") or {}
+                attachments = materialize_attachments(task, INPUT_DIR)
+                if attachments:
+                    print("DAVINCI_ATTACHMENTS " + json.dumps(
+                        {"count": len(attachments), "items": [a.to_dict() for a in attachments]}), flush=True)
+                try:
+                    result, result_dict = _run_agent(bridge, task, config, attachments)
+                    ok_run = result.success
+                except Exception as exc:  # noqa: BLE001 — one bad task must not kill the server
+                    print("DAVINCI_BOOT " + json.dumps({"run_error": repr(exc)[:200]}), flush=True)
+                    result_dict = {"success": False, "error": f"agent run failed: {exc!r}"[:400]}
+                    ok_run = False
+                # Signal the final result back to the requester over the same API.
+                if reply_to:
+                    try:
+                        bridge.signal_user("creatures/signal", str(reply_to),
+                                           {"kind": "davinci/result", "correlationId": correlation_id,
+                                            "result": result_dict})
+                    except Exception as exc:  # noqa: BLE001
+                        print("DAVINCI_BOOT " + json.dumps({"reply_error": repr(exc)[:160]}), flush=True)
+                served += 1
+                if not serve_forever:
+                    return 0 if ok_run else 2
+        except KeyboardInterrupt:  # pragma: no cover
+            return 0
+        finally:
             try:
                 bridge.close()
             except Exception:  # noqa: BLE001
                 pass
-            return 2
-        config = task.get("config") or {}
-        attachments = materialize_attachments(task, INPUT_DIR)
-        if attachments:
-            print("DAVINCI_ATTACHMENTS " + json.dumps(
-                {"count": len(attachments), "items": [a.to_dict() for a in attachments]}), flush=True)
-        result, result_dict = _run_agent(bridge, task, config, attachments)
-        # Signal the final result back to the requester over the same API.
-        if reply_to:
-            try:
-                bridge.signal_user("creatures/signal", str(reply_to),
-                                   {"kind": "davinci/result", "correlationId": correlation_id,
-                                    "result": result_dict})
-            except Exception as exc:  # noqa: BLE001
-                print("DAVINCI_BOOT " + json.dumps({"reply_error": repr(exc)[:160]}), flush=True)
-        try:
-            bridge.close()
-        except Exception:  # noqa: BLE001
-            pass
-        return 0 if result.success else 2
 
     # Offline / local self-test (no gateway): read the task + config from files.
     task = _read_task()

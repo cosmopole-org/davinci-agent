@@ -185,6 +185,34 @@ def test_reasoner_make_plan_and_propose_are_provider_independent():
     assert prop.thought == "thinking"
 
 
+def test_make_plan_is_dynamic_trivial_request_gets_single_step():
+    # For a trivial request the model returns a single result step; the planner
+    # must NOT pad it with analysis/verification/synthesis scaffolding.
+    client = _FakeClient([
+        json.dumps({"complexity": "trivial", "steps": [
+            {"title": "Reply 'Hello! How can I help?'", "category": "result",
+             "rationale": "Direct conversational answer, no tools needed."}]}),
+    ])
+    reasoner = LLMReasoner(client)
+    plan = reasoner.make_plan("say hi", [], ToolRegistry())
+    assert len(plan.steps) == 1
+    assert plan.steps[0].category == "result"
+
+
+def test_make_plan_still_decomposes_complex_requests():
+    # A complex request still yields a full multi-step plan ending in a result.
+    client = _FakeClient([
+        json.dumps({"complexity": "complex", "steps": [
+            {"title": "Fetch the page", "category": "research", "rationale": "r"},
+            {"title": "Compute the total", "category": "analysis", "rationale": "r"},
+            {"title": "Deliver the number", "category": "result", "rationale": "r"}]}),
+    ])
+    reasoner = LLMReasoner(client)
+    plan = reasoner.make_plan("multi-part task", [], ToolRegistry())
+    assert len(plan.steps) == 3
+    assert plan.steps[-1].category == "result"
+
+
 def test_reasoner_falls_back_to_heuristic_when_client_dead():
     reasoner = LLMReasoner(_FakeClient([]))  # generate() always returns None
     plan = reasoner.make_plan("obj", ["research"], ToolRegistry())

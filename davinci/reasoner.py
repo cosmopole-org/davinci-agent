@@ -163,25 +163,44 @@ class LLMReasoner:
     # -- planning strategy --------------------------------------------------
     def make_plan(self, objective: str, required_categories: List[str],
                   registry: ToolRegistry) -> Plan:
-        """Decompose the *actual* objective into concrete, executable steps."""
+        """Decompose the objective into steps — but only as many as it needs.
+
+        Planning is *dynamic*: the model first judges how much planning the
+        request actually warrants, then returns the SMALLEST plan that gets it
+        done. A trivial or conversational request collapses to a single
+        result-delivering step (no analysis/verification/synthesis scaffold);
+        only a genuinely multi-part objective gets a full decomposition. This
+        keeps Davinci flexible instead of over-planning every prompt.
+        """
         from .planning import Planner as _Planner  # local import avoids a cycle
 
         tools = [t.stub() for t in registry.all()]
         categories = sorted({t.get("category", "general") for t in tools} |
                             {"analysis", "verification", "synthesis"})
         system = (
-            "You are Davinci's planner. Decompose the objective into a CONCRETE, "
-            "ordered, minimal sequence of executable steps that actually accomplish "
-            "it end to end using the available tools. Each step's \"title\" must be a "
-            "specific, actionable instruction (name the exact URL, data, or "
-            "computation — never a vague 'do the research' placeholder). Pick each "
-            "step's \"category\" from the provided list so it routes to a matching "
-            "tool. Keep it tight (5-9 steps). The LAST step MUST have category "
-            "\"result\": it delivers the final answer by calling the terminal "
-            "result tool whose type matches the objective's required output "
-            "(e.g. result_as_number for a number), honoring any output-format "
-            "constraint stated in the objective. Reply with a single JSON object: "
-            "{\"steps\": [{\"title\": str, \"category\": str, \"rationale\": str}, ...]}."
+            "You are Davinci's planner. FIRST judge how much planning the objective "
+            "actually needs, then produce the SMALLEST plan that accomplishes it — "
+            "never over-plan. Match the plan's shape to the request:\n"
+            "- TRIVIAL (a greeting, a direct question you can answer from your own "
+            "knowledge, a one-line fact or calculation needing no tools): return a "
+            "SINGLE step with category \"result\" whose title states the answer to "
+            "deliver. Do NOT add analysis, verification or synthesis steps.\n"
+            "- SIMPLE (one tool call or one lookup answers it): return just that one "
+            "execution step followed by the final \"result\" step (about 2 steps).\n"
+            "- COMPLEX (multi-part; needs research, then computation, then checking): "
+            "decompose into a concrete, ordered, minimal sequence (up to ~9 steps), "
+            "adding analysis/verification steps ONLY where the difficulty warrants "
+            "them.\n"
+            "Each step's \"title\" must be a specific, actionable instruction (name the "
+            "exact URL, data, or computation — never a vague 'do the research' "
+            "placeholder). Pick each step's \"category\" from the provided list so it "
+            "routes to a matching tool. The LAST step MUST have category \"result\": it "
+            "delivers the final answer by calling the terminal result tool whose type "
+            "matches the objective's required output (e.g. result_as_number for a "
+            "number), honoring any output-format constraint stated in the objective. "
+            "Reply with a single JSON object: {\"complexity\": "
+            "\"trivial\"|\"simple\"|\"complex\", \"steps\": [{\"title\": str, "
+            "\"category\": str, \"rationale\": str}, ...]}."
         )
         prompt = json.dumps({
             "objective": objective,
@@ -194,6 +213,7 @@ class LLMReasoner:
         if not isinstance(steps, list) or not steps:
             self._emit("plan_fallback")
             return _Planner._heuristic_plan(objective, required_categories)
+        complexity = str((decision or {}).get("complexity") or "").strip().lower()
 
         plan = Plan(objective=objective)
         added = 0
@@ -213,7 +233,8 @@ class LLMReasoner:
                           "terminal tool with the computed value, in the exact required format",
                           "result", "Submit the typed final answer so it is signalled back "
                           "to the requester.")
-        self._emit("plan", model=self.active_model, steps=added)
+        self._emit("plan", model=self.active_model, steps=added,
+                   complexity=complexity or None)
         return plan
 
     # -- end-of-run synthesis ----------------------------------------------

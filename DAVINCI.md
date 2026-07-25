@@ -5,7 +5,10 @@ These instructions are loaded by Davinci's hierarchical instruction memory
 `CLAUDE.md`. Directory-level `DAVINCI.md` files override this one.
 
 ## Principles
-- Plan before acting; keep the plan visible and update step status as you go.
+- Plan proportionally: judge each request first and plan only as much as it
+  needs. Trivial or direct requests are answered straight away; reserve
+  multi-step decomposition for genuinely multi-part work. When you do plan, keep
+  the plan visible and update step status as you go.
 - Prefer the least-risk tool that satisfies a step.
 - Never run destructive shell commands; the guardrail layer will block them.
 - Escalate high-risk actions for human review instead of proceeding.

@@ -54,6 +54,78 @@ def _env_flag(name: str, *, default: bool) -> bool:
 
 
 # --------------------------------------------------------------------------- #
+# Per-step streaming
+#
+# A davinci run is a multi-step loop (plan → reason → act → reflect) where every
+# step is its own LLM round-trip. On a relay-backed backend a full run routinely
+# takes minutes, far longer than a client is willing to hold a socket open. So
+# instead of only signalling the *final* answer, we stream every trajectory
+# event — the model's thoughts, the tool it chose, what the tool returned, and
+# the final answer — back to the requesting user AS IT HAPPENS.
+#
+# Delivery is free: the tracer already produces one immutable ``TraceEvent`` per
+# decision; we hand it a sink that signals each event to the user's creature
+# over the gateway. The node fans a ``signalUser`` push out to every live socket
+# of that user, so the user's client (e.g. the Expo messenger) receives the
+# stream directly, with no polling and no synchronous wait. Each packet carries
+# the run's ``correlationId`` so the client can thread the stream to the prompt
+# it sent, and a coarse ``channel`` so a UI can render thoughts differently from
+# the final answer.
+# --------------------------------------------------------------------------- #
+
+# Map a fine-grained tracer event kind onto a coarse stream channel a client UI
+# can key on without knowing every internal event kind.
+_STREAM_CHANNELS = {
+    "run_start": "status",
+    "plan": "plan",
+    "replan": "plan",
+    "reason": "thought",
+    "reflection": "thought",
+    "decision": "action",
+    "human_review": "action",
+    "tool_result": "observation",
+    "guardrail_block": "observation",
+    "stuck": "observation",
+    "error": "observation",
+    "budget_exceeded": "status",
+    "final_answer": "final",
+    "run_end": "final",
+}
+
+
+def _stream_channel(kind: str) -> str:
+    return _STREAM_CHANNELS.get(kind, "trace")
+
+
+def _make_step_sink(bridge: Any, stream_to: str, correlation_id: Optional[str]):
+    """Build a tracer sink that streams each event to ``stream_to`` over the
+    bridge, or ``None`` when streaming is unavailable/disabled.
+
+    Every failure is swallowed: a step that cannot be delivered must never break
+    the agent loop — the authoritative final result is still signalled at the
+    end of the run.
+    """
+    if bridge is None or not stream_to:
+        return None
+    if not _env_flag("DAVINCI_STREAM_STEPS", default=True):
+        return None
+
+    def sink(event: Any) -> None:
+        try:
+            bridge.signal_user("creatures/signal", str(stream_to), {
+                "kind": "davinci/step",
+                "correlationId": correlation_id,
+                "seq": getattr(event, "seq", None),
+                "channel": _stream_channel(getattr(event, "kind", "")),
+                "event": event.to_dict(),
+            })
+        except Exception:  # noqa: BLE001 — streaming is best-effort
+            pass
+
+    return sink
+
+
+# --------------------------------------------------------------------------- #
 # Session sandbox lifecycle
 #
 # When a `sandbox_pc` tool is part of the configured catalog, the per-session
@@ -320,12 +392,19 @@ def _version() -> str:
 
 
 def _run_agent(bridge: Any, task: Dict[str, Any], config: Dict[str, Any],
-               attachments: List[Attachment]) -> tuple:
+               attachments: List[Attachment], reply_to: Optional[str] = None,
+               correlation_id: Optional[str] = None) -> tuple:
     """Build the agent from the (signal-delivered) task + config and run it.
 
     Returns ``(result, result_dict)``. The tool catalog and LLM config travel
     *with the task* over the signaling API; nothing is read from a task file in
     the gateway path.
+
+    ``reply_to``/``correlation_id`` (when present) enable per-step streaming:
+    each trajectory event is signalled to the requester as the run progresses,
+    in addition to the final result. A task may override the stream target with
+    an explicit ``streamTo`` (e.g. the backend routes steps straight to the end
+    user's creature).
     """
     objective = (task.get("objective")
                  or task.get("prompt")
@@ -396,7 +475,16 @@ def _run_agent(bridge: Any, task: Dict[str, Any], config: Dict[str, Any],
         ]
     print("DAVINCI_BOOT " + json.dumps({"task": task_summary, "capabilities": snapshot}), flush=True)
 
-    tracer = Tracer(stream=True)  # emits DAVINCI_TRACE lines as it goes
+    # Stream every trajectory event back to the requester as it happens. The
+    # target is the explicit ``streamTo`` when the backend provides one, else
+    # the packet's ``reply_to`` (the user who prompted). ``stream=True`` keeps
+    # the DAVINCI_TRACE stdout lines (VM logs) regardless.
+    stream_to = task.get("streamTo") or task.get("stream_to") or reply_to
+    tracer = Tracer(stream=True, sink=_make_step_sink(bridge, stream_to, correlation_id))
+    if stream_to and bridge is not None:
+        print("DAVINCI_STREAM " + json.dumps(
+            {"to": str(stream_to), "correlationId": correlation_id,
+             "enabled": _env_flag("DAVINCI_STREAM_STEPS", default=True)}), flush=True)
     mode = PermissionMode(os.environ.get("DAVINCI_PERMISSION_MODE", "auto"))
     # Risk ceiling for autonomous (auto-mode) tool execution. The agent runs
     # unattended as a creature, so network/automation tools (web fetch, headless
@@ -579,7 +667,9 @@ def main(argv: Optional[List[str]] = None) -> int:
                     print("DAVINCI_ATTACHMENTS " + json.dumps(
                         {"count": len(attachments), "items": [a.to_dict() for a in attachments]}), flush=True)
                 try:
-                    result, result_dict = _run_agent(bridge, task, config, attachments)
+                    result, result_dict = _run_agent(
+                        bridge, task, config, attachments,
+                        reply_to=reply_to, correlation_id=correlation_id)
                     ok_run = result.success
                 except Exception as exc:  # noqa: BLE001 — one bad task must not kill the server
                     print("DAVINCI_BOOT " + json.dumps({"run_error": repr(exc)[:200]}), flush=True)

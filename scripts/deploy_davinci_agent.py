@@ -86,6 +86,23 @@ def main() -> int:
     c.login(dt.ADMIN_USER)
     dt.ok(f"logged in as {dt.ADMIN_USER} (user_id={c.user_id})")
 
+    # Stop mode: gracefully stop a running davinci entity, then exit. Used by the
+    # e2e to bring the davinci VM down cleanly BEFORE the Caspar node is stopped
+    # (rather than yanked with the node). Best-effort — a not-running entity is
+    # fine; the caller ignores failures.
+    stop_pid = os.environ.get("DAVINCI_STOP_PROGRAM_ID", "").strip()
+    if stop_pid:
+        entity = os.environ.get("DAVINCI_ENTITY_ID", "davinci").strip() or "davinci"
+        dt.info(f"stopping davinci entity {entity} on program {stop_pid} (graceful pre-shutdown)")
+        try:
+            c.stop_entity(stop_pid, entity)
+            dt.ok(f"stopEntity requested for {stop_pid}/{entity}")
+            print(f"DAVINCI_STOPPED={stop_pid}", flush=True)
+        except Exception as exc:  # noqa: BLE001 — the entity may not be running
+            dt.warn(f"stopEntity failed ({exc}); the entity may not be running")
+        c.close()
+        return 0
+
     bake = dt.llm_bake_env()
     if bake:
         provider = bake.get("LLM_PROVIDER", "gemini")

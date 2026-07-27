@@ -222,6 +222,19 @@ class CasparSignalingClient:
             raise RuntimeError(f"runEntity failed: {r}")
         return r.get("vmId", "")
 
+    def stop_entity(self, program_id: str, entity_id: str = "davinci") -> Dict[str, Any]:
+        """Stop a running standalone VM entity (graceful shutdown).
+
+        Used to bring a davinci docker VM down cleanly before the Caspar node is
+        stopped, rather than having it yanked when the node process exits.
+        """
+        r = self.send("/programs/stopEntity", {
+            "programId": program_id, "machineId": program_id, "entityId": entity_id,
+        })
+        if r.get("_res_code", -1) != 0:
+            raise RuntimeError(f"stopEntity failed: {r}")
+        return r
+
     def read_vm_logs(self, vm_id: str, log_type: str = "", count: int = 500, offset: int = 0) -> List[Any]:
         r = self.send("/machines/readVmLogs", {"vmId": vm_id, "logType": log_type,
                                                "count": count, "offset": offset})

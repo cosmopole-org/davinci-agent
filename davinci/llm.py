@@ -579,6 +579,31 @@ def _models_for(provider: str, config: Dict[str, Any]) -> Optional[List[str]]:
     return [env_one] if env_one else None
 
 
+# OpenRouter has no model literally named "openrouter/free": operators reach for
+# it to mean "use a free model", but the API 400s on every request, which sends
+# the agent silently into its heuristic fallback. "openrouter/auto" IS valid (it
+# lets OpenRouter route the request), so treat the common typo as that and warn.
+_OPENROUTER_MODEL_ALIASES = {
+    "openrouter/free": "openrouter/auto",
+    "free": "openrouter/auto",
+    "auto": "openrouter/auto",
+}
+
+
+def _sanitize_models(canonical: str, models: Optional[List[str]]) -> Optional[List[str]]:
+    if canonical != "openrouter" or not models:
+        return models
+    out: List[str] = []
+    for m in models:
+        fixed = _OPENROUTER_MODEL_ALIASES.get(str(m).strip().lower())
+        if fixed and fixed != str(m).strip():
+            _emit("OPENROUTER", "model_normalized", requested=m, using=fixed)
+            out.append(fixed)
+        else:
+            out.append(m)
+    return out
+
+
 def make_client(provider: str, api_key: str, *, models: Optional[List[str]] = None,
                 **kw: Any) -> LLMClient:
     """Construct the client for a named provider (raises on unknown provider)."""
@@ -587,7 +612,7 @@ def make_client(provider: str, api_key: str, *, models: Optional[List[str]] = No
         raise ValueError(f"unknown LLM provider: {provider!r} "
                          f"(known: {sorted(set(PROVIDER_ALIASES.values()))})")
     cls = PROVIDERS[canonical][0]
-    return cls(api_key, models=models, **kw)
+    return cls(api_key, models=_sanitize_models(canonical, models), **kw)
 
 
 def client_from_config(config: Dict[str, Any]) -> Optional[LLMClient]:

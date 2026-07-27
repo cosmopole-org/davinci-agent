@@ -232,3 +232,19 @@ def test_synthesize_uses_tool_results_and_obeys_format():
     plan = Plan(objective="o")
     plan.add_step("synth", "synthesis", "r")
     assert reasoner.synthesize("o", plan, mem) == "42"
+
+
+def test_make_client_normalizes_invalid_openrouter_free_model():
+    """`openrouter/free` is not a real OpenRouter model — every request 400s and
+    silently drops davinci to the heuristic. Normalize it to the valid
+    `openrouter/auto` so a common misconfig doesn't masquerade as tool failures."""
+    from davinci.llm import make_client
+
+    c = make_client("openrouter", "sk-test", models=["openrouter/free"])
+    assert c.models == ["openrouter/auto"]
+    # A real model id is left untouched.
+    c2 = make_client("openrouter", "sk-test", models=["meta-llama/llama-3.1-8b-instruct:free"])
+    assert c2.models == ["meta-llama/llama-3.1-8b-instruct:free"]
+    # Normalization is openrouter-only.
+    g = make_client("gemini", "sk-test", models=["openrouter/free"])
+    assert g.models == ["openrouter/free"]

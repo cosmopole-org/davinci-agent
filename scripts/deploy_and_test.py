@@ -265,10 +265,49 @@ def docker_image_exists(program_id: str, entity_id: str) -> bool:
         return False
 
 
-def wait_for_image(program_id: str, entity_id: str, timeout: int = 240) -> bool:
+def docker_image_id(program_id: str, entity_id: str) -> str:
+    """Current image ID for a program/entity tag, or "" when it doesn't exist.
+
+    A successful docker build re-tags the image to a NEW id when the build
+    context changed; a fully-cached (no-op) rebuild keeps the SAME id. We use
+    this to tell a real rebuild from a stale tag on a redeploy.
+    """
     image = f"{program_id.replace('@', '_')}/{entity_id}"
-    info(f"waiting for node to build image {image} (≤{timeout}s)…")
+    try:
+        out = subprocess.run(["docker", "images", "--no-trunc", "--format", "{{.ID}}", image],
+                             capture_output=True, text=True, timeout=15)
+        lines = [ln.strip() for ln in out.stdout.splitlines() if ln.strip()]
+        return lines[0] if lines else ""
+    except Exception:
+        return ""
+
+
+def wait_for_image(program_id: str, entity_id: str, timeout: int = 240,
+                   prev_image_id: Optional[str] = None) -> bool:
+    """Wait until the node has (re)built the entity's docker image.
+
+    The node builds asynchronously and only re-tags on success, so on a REDEPLOY
+    the old tag is present the whole time — a plain existence check returns
+    instantly and runEntity would recreate the container from the PRE-rebuild
+    image. When ``prev_image_id`` is provided (the id captured just before the
+    redeploy), wait for the id to actually CHANGE, so the container is recreated
+    from the new build. If it never changes within the timeout, the rebuild was a
+    cached no-op (identical code) — the tag is already current, so proceed.
+    """
+    image = f"{program_id.replace('@', '_')}/{entity_id}"
     deadline = time.time() + timeout
+    if prev_image_id:
+        info(f"waiting for node to REBUILD image {image} (was {prev_image_id[:19]}, ≤{timeout}s)…")
+        while time.time() < deadline:
+            cur = docker_image_id(program_id, entity_id)
+            if cur and cur != prev_image_id:
+                ok(f"image rebuilt: {image} -> {cur[:19]}")
+                return True
+            time.sleep(3)
+        warn(f"image id unchanged after {timeout}s — treating as a cached/no-op rebuild "
+             f"(identical code); proceeding with the current image")
+        return True
+    info(f"waiting for node to build image {image} (≤{timeout}s)…")
     while time.time() < deadline:
         if docker_image_exists(program_id, entity_id):
             return True
@@ -447,10 +486,15 @@ def deploy_davinci(c: CasparSignalingClient, bake_env: dict = None,
     ``program_id`` is None, a new creature + program are created (first-time
     bootstrap).
     """
+    prev_image_id = None
     if program_id:
         info(f"redeploying davinci entity onto existing program {program_id} "
              f"(entity {entity_id}) — no new creature")
         machine_id = ""
+        # Capture the current image id BEFORE the rebuild so wait_for_image can
+        # wait for it to actually change (the node rebuilds async and keeps the
+        # old tag until the new build succeeds).
+        prev_image_id = docker_image_id(program_id, entity_id)
     else:
         machine_id = c.create_machine_creature(f"m-davinci-agent-{RUN_TAG}")
         program_id = c.create_program(machine_id, "/davinci", "docker", "davinci agent")
@@ -463,7 +507,9 @@ def deploy_davinci(c: CasparSignalingClient, bake_env: dict = None,
         dockerfile = dockerfile + CA_DOCKERFILE_SNIPPET
     dockerfile = dockerfile + _bake_env_snippet(bake_env or {})
     c.deploy(program_id, entity_id, "docker", b64_bytes(dockerfile.encode()), files_b64=files)
-    if not wait_for_image(program_id, entity_id, timeout=360):
+    _rebuild_timeout = int(os.environ.get("DAVINCI_REBUILD_TIMEOUT", "360"))
+    if not wait_for_image(program_id, entity_id, timeout=_rebuild_timeout,
+                          prev_image_id=prev_image_id):
         raise RuntimeError("davinci image not built in time")
     ok(f"davinci creature deployed: program={program_id} entity={entity_id}")
     return {"machine_id": machine_id, "program_id": program_id, "entity_id": entity_id}

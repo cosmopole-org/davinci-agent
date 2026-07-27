@@ -211,12 +211,22 @@ class CasparSignalingClient:
 
     def run_entity(self, program_id: str, entity_id: str, *, params: Optional[Dict[str, str]] = None,
                    ram_mb: int = 512, disk_gb: int = 1, cpu_cores: int = 1,
-                   max_exec_seconds: int = 120) -> str:
+                   max_exec_seconds: int = 120, force_restart: bool = False) -> str:
+        """Start the entity's standalone VM.
+
+        ``force_restart`` is CRITICAL after a (re)deploy: the node's run_vm is
+        idempotent by default — an existing container is *resumed* (its old
+        writable layer, i.e. the OLD code) instead of being recreated from the
+        freshly-built image. Passing ``forceRestart: true`` stops+removes the old
+        container and creates a fresh one from the new image, so redeployed code
+        actually runs. (The persistent per-VM /data mount survives either way.)
+        """
         r = self.send("/programs/runEntity", {
             "programId": program_id, "machineId": program_id, "entityId": entity_id,
             "resources": {"ramMb": ram_mb, "diskGb": disk_gb, "cpuCores": cpu_cores,
                           "maxExecTimeSeconds": max_exec_seconds},
             "params": params or {},
+            "forceRestart": force_restart,
         })
         if r.get("_res_code", -1) != 0:
             raise RuntimeError(f"runEntity failed: {r}")

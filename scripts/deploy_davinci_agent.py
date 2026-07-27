@@ -137,12 +137,20 @@ def main() -> int:
         cpus = int(os.environ.get("DAVINCI_VM_CPUS", "1"))
         max_s = _vm_max_seconds()
         max_label = "unlimited (~317y)" if max_s == _VM_MAX_UNLIMITED else f"{max_s}s"
+        # force_restart is essential: this runEntity always follows a fresh
+        # (re)deploy, so we must stop+remove any existing davinci container and
+        # recreate it from the just-built image. Without it the node's idempotent
+        # run_vm resumes the OLD container (old code) — the reason redeployed
+        # changes (e.g. removed result_as_* tools) never took effect. Opt out with
+        # DAVINCI_FORCE_RESTART=0 only if you deliberately want to resume.
+        force_restart = _truthy(os.environ.get("DAVINCI_FORCE_RESTART", "1"))
         dt.info(f"starting davinci as a standalone VM entity via runEntity "
-                f"(ram={ram}MB disk={disk}GB cpu={cpus} maxExec={max_label})")
+                f"(ram={ram}MB disk={disk}GB cpu={cpus} maxExec={max_label} "
+                f"forceRestart={force_restart})")
         try:
             vm_id = c.run_entity(davinci["program_id"], davinci["entity_id"],
                                  ram_mb=ram, disk_gb=disk, cpu_cores=cpus,
-                                 max_exec_seconds=max_s)
+                                 max_exec_seconds=max_s, force_restart=force_restart)
             if vm_id:
                 dt.ok(f"davinci VM entity running: {vm_id}")
                 print("DAVINCI_VM_ID=" + vm_id, flush=True)

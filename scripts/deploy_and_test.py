@@ -433,9 +433,28 @@ def _bake_env_snippet(env: dict) -> str:
     return ("ENV " + " ".join(parts) + "\n") if parts else ""
 
 
-def deploy_davinci(c: CasparSignalingClient, bake_env: dict = None) -> dict:
-    machine_id = c.create_machine_creature(f"m-davinci-agent-{RUN_TAG}")
-    program_id = c.create_program(machine_id, "/davinci", "docker", "davinci agent")
+def deploy_davinci(c: CasparSignalingClient, bake_env: dict = None,
+                   program_id: str = None, entity_id: str = "davinci") -> dict:
+    """Deploy (or re-deploy) the davinci docker entity.
+
+    A Caspar creature program is permanent and re-deployable: an updated entity
+    — a new Dockerfile plus payload/files — can be pushed onto the SAME program
+    id via ``deployEntity`` any number of times. So when ``program_id`` is given
+    (the id already recorded in the manifest), we skip minting a new
+    creature/program and just redeploy a FRESH entity onto it. This picks up
+    davinci code changes while keeping the program id stable — every already
+    deployed agent proxy still targets a valid davinci (no orphaning). When
+    ``program_id`` is None, a new creature + program are created (first-time
+    bootstrap).
+    """
+    if program_id:
+        info(f"redeploying davinci entity onto existing program {program_id} "
+             f"(entity {entity_id}) — no new creature")
+        machine_id = ""
+    else:
+        machine_id = c.create_machine_creature(f"m-davinci-agent-{RUN_TAG}")
+        program_id = c.create_program(machine_id, "/davinci", "docker", "davinci agent")
+        entity_id = "davinci"
     files = {"bundle.tar": b64_bytes(davinci_bundle_tar())}
     dockerfile = DAVINCI_DOCKERFILE
     ca = _ca_bundle_bytes()
@@ -443,11 +462,11 @@ def deploy_davinci(c: CasparSignalingClient, bake_env: dict = None) -> dict:
         files["ca-certificates.crt"] = b64_bytes(ca)
         dockerfile = dockerfile + CA_DOCKERFILE_SNIPPET
     dockerfile = dockerfile + _bake_env_snippet(bake_env or {})
-    c.deploy(program_id, "davinci", "docker", b64_bytes(dockerfile.encode()), files_b64=files)
-    if not wait_for_image(program_id, "davinci", timeout=360):
+    c.deploy(program_id, entity_id, "docker", b64_bytes(dockerfile.encode()), files_b64=files)
+    if not wait_for_image(program_id, entity_id, timeout=360):
         raise RuntimeError("davinci image not built in time")
-    ok(f"davinci creature deployed: program={program_id}")
-    return {"machine_id": machine_id, "program_id": program_id, "entity_id": "davinci"}
+    ok(f"davinci creature deployed: program={program_id} entity={entity_id}")
+    return {"machine_id": machine_id, "program_id": program_id, "entity_id": entity_id}
 
 
 def signal_davinci(c: CasparSignalingClient, davinci: dict, tool_recs: list) -> bool:

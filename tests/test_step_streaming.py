@@ -55,6 +55,8 @@ def test_sink_streams_each_event_to_the_user():
     assert key == "creatures/signal"
     assert user_id == "user-99"
     assert packet["kind"] == "davinci/step"
+    # Non-terminal multi-response chunk so the proxy keeps the correlation open.
+    assert packet["stream"] is True and packet["final"] is False
     assert packet["correlationId"] == "corr-7"
     assert packet["channel"] == "thought"
     assert packet["seq"] == 1

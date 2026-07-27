@@ -103,8 +103,15 @@ def _stream_channel(kind: str) -> str:
 
 
 def _make_step_sink(bridge: Any, stream_to: str, correlation_id: Optional[str]):
-    """Build a tracer sink that streams each event to ``stream_to`` over the
-    bridge, or ``None`` when streaming is unavailable/disabled.
+    """Build a tracer sink that streams each trajectory event back to
+    ``stream_to`` over the bridge, or ``None`` when streaming is
+    unavailable/disabled.
+
+    ``stream_to`` is normally the proxy agent entity (the packet's ``replyTo``),
+    so every step rides the SAME correlation the final result does: the node's
+    proxy relays each chunk to the original requester and keeps the correlation
+    alive because the chunk is marked ``stream: true`` (a non-terminal
+    multi-response message). The terminal ``davinci/result`` then closes it.
 
     Every failure is swallowed: a step that cannot be delivered must never break
     the agent loop — the authoritative final result is still signalled at the
@@ -119,6 +126,10 @@ def _make_step_sink(bridge: Any, stream_to: str, correlation_id: Optional[str]):
         try:
             bridge.signal_user("creatures/signal", str(stream_to), {
                 "kind": "davinci/step",
+                # Non-terminal multi-response chunk: the proxy relays it and keeps
+                # the correlation open for more (steps + the final result).
+                "stream": True,
+                "final": False,
                 "correlationId": correlation_id,
                 "seq": getattr(event, "seq", None),
                 "channel": _stream_channel(getattr(event, "kind", "")),
@@ -495,11 +506,14 @@ def _run_agent(bridge: Any, task: Dict[str, Any], config: Dict[str, Any],
         ]
     print("DAVINCI_BOOT " + json.dumps({"task": task_summary, "capabilities": snapshot}), flush=True)
 
-    # Stream every trajectory event back to the requester as it happens. The
-    # target is the explicit ``streamTo`` when the backend provides one, else
-    # the packet's ``reply_to`` (the user who prompted). ``stream=True`` keeps
-    # the DAVINCI_TRACE stdout lines (VM logs) regardless.
-    stream_to = task.get("streamTo") or task.get("stream_to") or reply_to
+    # Stream every trajectory event back through the SAME channel the final
+    # result uses: the proxy agent entity (``reply_to``). Steps and the final
+    # answer then share one correlation — davinci signals both to the proxy,
+    # which relays each to the original requester (multi-response) and closes the
+    # correlation on the terminal ``davinci/result``. Falling back to an explicit
+    # ``streamTo`` only when there is no proxy reply path (a direct, non-proxied
+    # caller). ``stream=True`` keeps the DAVINCI_TRACE stdout lines (VM logs).
+    stream_to = reply_to or task.get("streamTo") or task.get("stream_to")
     tracer = Tracer(stream=True, sink=_make_step_sink(bridge, stream_to, correlation_id))
     if stream_to and bridge is not None:
         print("DAVINCI_STREAM " + json.dumps(
@@ -728,6 +742,9 @@ def main(argv: Optional[List[str]] = None) -> int:
                     try:
                         bridge.signal_user("creatures/signal", str(reply_to),
                                            {"kind": "davinci/result", "correlationId": correlation_id,
+                                            # Terminal message: closes the proxy
+                                            # correlation opened by the streamed steps.
+                                            "final": True, "stream": False,
                                             "result": result_dict})
                     except Exception as exc:  # noqa: BLE001
                         print("DAVINCI_BOOT " + json.dumps({"reply_error": repr(exc)[:160]}), flush=True)

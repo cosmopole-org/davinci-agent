@@ -86,27 +86,25 @@ def main() -> int:
     c.login(dt.ADMIN_USER)
     dt.ok(f"logged in as {dt.ADMIN_USER} (user_id={c.user_id})")
 
-    # Reuse mode: (re)start an EXISTING davinci program's standalone VM instead of
-    # minting a new creature/program. Set DAVINCI_REUSE_PROGRAM_ID to the program
-    # id already recorded in the manifest. This keeps the same program id — so
-    # every already-deployed agent proxy still targets a live davinci — while
-    # bringing a stopped container back up via runEntity below. No image rebuild,
-    # so no LLM key is needed (it is already baked into the existing image).
-    reuse_pid = os.environ.get("DAVINCI_REUSE_PROGRAM_ID", "").strip()
-    if reuse_pid:
-        entity = os.environ.get("DAVINCI_ENTITY_ID", "davinci").strip() or "davinci"
-        dt.info(f"reuse mode: skipping build/deploy; (re)starting existing davinci "
-                f"program {reuse_pid} (entity {entity}) via runEntity")
-        davinci = {"program_id": reuse_pid, "entity_id": entity}
+    bake = dt.llm_bake_env()
+    if bake:
+        provider = bake.get("LLM_PROVIDER", "gemini")
+        dt.info(f"baking LLM backbone into the creature image (provider={provider})")
     else:
-        bake = dt.llm_bake_env()
-        if bake:
-            provider = bake.get("LLM_PROVIDER", "gemini")
-            dt.info(f"baking LLM backbone into the creature image (provider={provider})")
-        else:
-            dt.warn("no LLM key in the environment — the agent will fall back to the "
-                    "heuristic reasoner (set GEMINI_API_KEY for real reasoning)")
+        dt.warn("no LLM key in the environment — the agent will fall back to the "
+                "heuristic reasoner (set GEMINI_API_KEY for real reasoning)")
 
+    # Reuse mode: redeploy a FRESH davinci entity onto an EXISTING program instead
+    # of minting a new creature/program. Set DAVINCI_REUSE_PROGRAM_ID to the
+    # program id already recorded in the manifest. A Caspar program is permanent
+    # and re-deployable, so the updated entity (new Dockerfile + bundle) lands on
+    # the SAME program id — picking up code changes while every already-deployed
+    # agent proxy keeps targeting a valid davinci (no orphaning).
+    reuse_pid = os.environ.get("DAVINCI_REUSE_PROGRAM_ID", "").strip()
+    entity = os.environ.get("DAVINCI_ENTITY_ID", "davinci").strip() or "davinci"
+    if reuse_pid:
+        davinci = dt.deploy_davinci(c, bake_env=bake, program_id=reuse_pid, entity_id=entity)
+    else:
         davinci = dt.deploy_davinci(c, bake_env=bake)
 
     # Machine-readable markers for the caller.

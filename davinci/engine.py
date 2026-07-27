@@ -29,7 +29,6 @@ from .mcp import ToolDescriptor, ToolRegistry
 from .observability import Budget, Tracer
 from .permissions import Decision, Outcome, PermissionEngine, Risk, ToolAction
 from .planning import Plan, Planner, PlanStep, StepStatus
-from .result_tool import coerce_result_value
 
 
 # ---------------------------------------------------------------------------
@@ -210,8 +209,9 @@ class DavinciAgent:
         # (e.g. LLMReasoner) can attach them to their LLM calls. The
         # deterministic HeuristicReasoner simply ignores them.
         atts = list(attachments or [])
-        # Set when a terminal *result* tool delivers the final answer, so the run
-        # loop stops immediately instead of running further steps or synthesis.
+        # Set when a step's reasoning delivers the final answer directly (a
+        # trivial/conversational turn), so the run loop stops immediately and
+        # end-of-run synthesis is skipped rather than regenerating over it.
         self._final_delivered = False
         if atts:
             self.working.set_fact("attachments", atts)
@@ -269,21 +269,19 @@ class DavinciAgent:
 
             answer = self._run_step(objective, plan, step, pending_review) or answer
             if self._final_delivered:
-                # A terminal result tool produced the final, typed answer.
-                self._record("final_answer", "Final answer delivered via result tool")
+                # A step's reasoning produced the final answer directly.
+                self._record("final_answer", "Final answer delivered by step reasoning")
                 break
 
         success = plan.is_complete and not plan.has_failures and self.budget.exceeded() is None
-        # Resolve the final answer.
-        #
-        # A terminal *result* tool already delivered the precise, typed answer —
-        # keep it verbatim (synthesis must not paraphrase a typed result). For
-        # every other run — a tool-driven objective with no explicit result tool,
-        # OR a purely conversational turn with no tools at all — ask the reasoner
-        # to synthesise the final, user-facing answer (it answers conversational
-        # prompts directly, in persona, instead of forcing tool talk). The
-        # deterministic step summary is only a last resort when no LLM reasoner is
-        # wired, so a plain "How are you?" never surfaces as "Completed N steps".
+        # Resolve the final answer. There is no terminal result tool: the answer
+        # is the LLM's own conversational output, sent straight back over the
+        # response signal. If a step already answered directly, keep it; otherwise
+        # ask the reasoner to synthesise the final, user-facing answer over the
+        # whole run (it also answers purely conversational prompts directly, in
+        # persona, instead of forcing tool talk). The deterministic step summary
+        # is only a last resort when no LLM reasoner is wired, so a plain
+        # "How are you?" never surfaces as "Completed N steps".
         if self._final_delivered and isinstance(answer, str) and answer.strip():
             pass
         else:
@@ -312,32 +310,22 @@ class DavinciAgent:
         if proposal.final_answer is not None:
             plan.complete(step.id, proposal.final_answer)
             self.working.remember("assistant", proposal.final_answer)
+            # Treat this as the run's final answer only when no further steps
+            # remain — so an intermediate cognition step that emits a summary
+            # doesn't cut a multi-step plan short. When it IS the last step, the
+            # model answered directly (a trivial/conversational turn): keep it and
+            # skip redundant end-of-run synthesis.
+            if plan.next_pending() is None:
+                self._final_delivered = True
             return proposal.final_answer
 
         if proposal.tool is None:
-            # Cognitive / verification step with no tool — mark done.
+            # Cognitive / verification / synthesis step with no tool — mark done.
+            # The final answer is produced by end-of-run synthesis.
             plan.complete(step.id, "(no tool required)")
             return None
 
         tool = proposal.tool
-
-        # Terminal *result* tool: the model is delivering the final answer. Coerce
-        # its typed ``value`` into the run answer and stop — never dispatch it to a
-        # creature (there is none). A missing/invalid value fails the step so the
-        # run can fall back to end-of-run synthesis.
-        if getattr(tool, "terminal", False):
-            value = coerce_result_value(tool.name, proposal.args)
-            if value is None:
-                plan.fail(step.id, f"{tool.name} called without a valid 'value'")
-                self._record("tool_result", f"{tool.name} missing/invalid value",
-                             step_id=step.id, tool=tool.name, ok=False)
-                return None
-            plan.complete(step.id, value)
-            self.working.remember("assistant", value)
-            self._final_delivered = True
-            self._record("tool_result", f"{tool.name} delivered final answer",
-                         step_id=step.id, tool=tool.name, ok=True, output=value)
-            return value
         action = ToolAction(tool_id=tool.name, category=tool.category,
                             risk=Risk(tool.risk), args=proposal.args,
                             requires_network=tool.requires_network)

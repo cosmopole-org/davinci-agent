@@ -238,17 +238,14 @@ def test_conversational_prompt_gets_spoken_answer_not_step_summary():
     assert "Completed" not in result.answer
 
 
-def test_terminal_result_answer_is_not_overridden_by_synthesis():
-    """When a terminal result tool delivers a precise typed answer, the engine
-    keeps it verbatim and does NOT let synthesis paraphrase it."""
+def test_step_delivered_final_answer_is_not_overridden_by_synthesis():
+    """A final answer produced directly by a step's reasoning (a trivial or
+    conversational turn) is kept verbatim; end-of-run synthesis does not run over
+    it."""
     from davinci import DavinciAgent, EchoExecutor
     from davinci.engine import ActionProposal, Reflection
-    from davinci.mcp import ToolRegistry
-    from davinci.result_tool import register_result_tools
 
-    registry = register_result_tools(ToolRegistry())
-
-    class ResultReasoner:
+    class DirectReasoner:
         def set_instructions(self, text):
             pass
 
@@ -256,10 +253,7 @@ def test_terminal_result_answer_is_not_overridden_by_synthesis():
             pass
 
         def propose(self, objective, step, registry, memory):
-            tool = registry.get("result_as_text")
-            if tool is not None:
-                return ActionProposal(tool=tool, args={"value": "42"}, thought="deliver")
-            return ActionProposal(tool=None, final_answer=None)
+            return ActionProposal(tool=None, final_answer="The answer is 42.")
 
         def reflect(self, objective, plan, memory):
             return Reflection(satisfied=True)
@@ -267,9 +261,9 @@ def test_terminal_result_answer_is_not_overridden_by_synthesis():
         def synthesize(self, objective, plan, memory):
             return "SYNTHESIZED OVERRIDE"
 
-    agent = DavinciAgent(registry=registry, reasoner=ResultReasoner(), executor=EchoExecutor())
+    agent = DavinciAgent(reasoner=DirectReasoner(), executor=EchoExecutor())
     result = agent.run("give me the number")
-    assert result.answer == "42"
+    assert result.answer == "The answer is 42."
 
 
 def test_engine_hands_rendered_skill_to_reasoner():
@@ -298,21 +292,25 @@ def test_engine_hands_rendered_skill_to_reasoner():
     assert "You are the QA agent." in seen.get("instructions", "")
 
 
-def test_no_result_as_number_terminal_tool():
-    """This is a conversational platform: there is no numeric terminal tool — a
-    number is delivered as text through the conversational final answer. The
-    brittle result_as_number (which failed whenever value wasn't a clean number)
-    is removed."""
-    from davinci.mcp import ToolRegistry
-    from davinci.result_tool import RESULT_TYPES, register_result_tools
+def test_result_tool_mechanism_fully_removed():
+    """The terminal result-tool mechanism is gone entirely: the module no longer
+    exists and ToolDescriptor has no `terminal` flag. The final answer comes
+    solely from the LLM's conversational output, sent back over the response
+    signal."""
+    import dataclasses
+    import importlib
 
-    reg = register_result_tools(ToolRegistry())
-    assert reg.get("result_as_number") is None
-    assert "result_as_number" not in RESULT_TYPES
-    # The remaining terminal tools stay available.
-    assert reg.get("result_as_text") is not None
-    for name in ("result_as_boolean", "result_as_json", "result_as_list"):
-        assert reg.get(name) is not None
+    from davinci.mcp import ToolDescriptor
+
+    try:
+        importlib.import_module("davinci.result_tool")
+        raise AssertionError("davinci.result_tool should have been removed")
+    except ModuleNotFoundError:
+        pass
+
+    field_names = {f.name for f in dataclasses.fields(ToolDescriptor)}
+    assert "terminal" not in field_names
+    assert "terminal" not in ToolDescriptor("t", "d").stub()
 
 
 def test_wait_for_task_unwraps_client_payload_wrapper():

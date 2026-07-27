@@ -28,10 +28,6 @@ class ToolDescriptor:
     risk: str = "medium"
     requires_network: bool = False
     server: str = "local"
-    # Terminal tools deliver the run's FINAL answer (see davinci.result_tool):
-    # the engine intercepts a call to one, coerces its typed ``value`` into the
-    # final answer, and ends the run — it is never dispatched to a creature.
-    terminal: bool = False
     # Deferred: the full input schema is only materialised on demand so a large
     # catalog doesn't consume context until a tool is selected.
     _schema_loader: Optional[Callable[[], Dict[str, Any]]] = field(default=None, repr=False)
@@ -44,11 +40,8 @@ class ToolDescriptor:
 
     def stub(self) -> Dict[str, Any]:
         """The cheap, always-loaded view (no schema)."""
-        stub = {"name": self.name, "description": self.description,
+        return {"name": self.name, "description": self.description,
                 "category": self.category, "risk": self.risk, "server": self.server}
-        if self.terminal:
-            stub["terminal"] = True
-        return stub
 
 
 class ToolRegistry:

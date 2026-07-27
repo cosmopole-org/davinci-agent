@@ -178,12 +178,11 @@ class LLMReasoner:
             "\"args\" using the chosen tool's \"arg_schema\" (use those exact property "
             "names and types) — e.g. provide runnable code for a code arg, a real query "
             "string for a query arg. Only fall back to a generic args.task when the tool "
-            "exposes no arg_schema. To DELIVER THE FINAL ANSWER (e.g. a \"result\" step, "
-            "or once you have computed the result), pick the terminal tool whose type "
-            "matches the required output — result_as_text / result_as_boolean / "
-            "result_as_json / result_as_list (a numeric answer is delivered as text "
-            "via result_as_text) — and put the answer in "
-            "args.value with the correct type; that ends the run. When the user supplied attachments, they are sent "
+            "exposes no arg_schema. When you already have everything needed to answer "
+            "(a final/result/synthesis step, a trivial or conversational request, or "
+            "once you have computed the result), set \"tool\" to null and put the "
+            "complete user-facing answer in \"final_answer\" — that ends the run and the "
+            "answer is sent straight back to the user. When the user supplied attachments, they are sent "
             "alongside this message as standard multimodal parts — inspect them when the "
             "step needs their content."
         )
@@ -263,10 +262,10 @@ class LLMReasoner:
             "Each step's \"title\" must be a specific, actionable instruction (name the "
             "exact URL, data, or computation — never a vague 'do the research' "
             "placeholder). Pick each step's \"category\" from the provided list so it "
-            "routes to a matching tool. The LAST step MUST have category \"result\": it "
-            "delivers the final answer by calling the terminal result tool whose type "
-            "matches the objective's required output (e.g. result_as_text for a spoken "
-            "or numeric answer), honoring any output-format constraint stated in the objective. "
+            "routes to a matching tool. The LAST step MUST have category \"result\": a "
+            "cognition-only step that composes the final user-facing answer from the "
+            "gathered results (no tool needed), honoring any output-format constraint "
+            "stated in the objective. "
             "Reply with a single JSON object: {\"complexity\": "
             "\"trivial\"|\"simple\"|\"complex\", \"steps\": [{\"title\": str, "
             "\"category\": str, \"rationale\": str}, ...]}."
@@ -313,10 +312,10 @@ class LLMReasoner:
         if added == 0:
             return _Planner._heuristic_plan(objective, required_categories)
         if plan.steps[-1].category not in ("result", "synthesis"):
-            plan.add_step("Deliver the final answer by calling the matching result_as_* "
-                          "terminal tool with the computed value, in the exact required format",
-                          "result", "Submit the typed final answer so it is signalled back "
-                          "to the requester.")
+            plan.add_step("Compose the final user-facing answer from the gathered results, "
+                          "in the exact required format",
+                          "result", "Produce the final conversational answer so it is "
+                          "signalled back to the user.")
         self._emit("plan", model=self.active_model, steps=added,
                    complexity=complexity or None)
         return plan

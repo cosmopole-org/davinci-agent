@@ -41,6 +41,11 @@ class LLMReasoner:
         # start of a run (see ``DavinciAgent.run(history=...)``). Empty for a
         # fresh one-shot prompt.
         self._conversation: List[Dict[str, str]] = []
+        # The agent's system instruction (its deployed skill / personality),
+        # seeded by the engine (see ``DavinciAgent.set_instructions``). Prepended
+        # to every LLM system prompt so the model actually adopts the persona —
+        # empty for an agent deployed without a skill.
+        self._instructions: str = ""
 
     # -- conversation --------------------------------------------------------
     def set_conversation(self, history: List[Dict[str, Any]]) -> None:
@@ -52,6 +57,32 @@ class LLMReasoner:
             for m in (history or [])
             if isinstance(m, dict) and str(m.get("content") or "").strip()
         ]
+
+    # -- system instruction (deployed skill / personality) ------------------
+    def set_instructions(self, text: Optional[str]) -> None:
+        """Adopt the agent's system instruction (the skill file a Caspar proxy
+        "agent" entity attaches, layered on the DAVINCI.md hierarchy).
+
+        The engine hands this over so planning, per-step tool selection,
+        reflection and final synthesis are all conditioned on the persona. Without
+        it the skill would only appear in the run trace and never reach the model,
+        so a deployed agent would ignore the personality it was created with."""
+        self._instructions = (text or "").strip()
+
+    def _system(self, base: str) -> str:
+        """Prepend the agent's system instruction to a task-specific system
+        prompt so the model reasons and answers in the deployed persona. A no-op
+        when the agent has no skill."""
+        if not self._instructions:
+            return base
+        return (
+            "SYSTEM INSTRUCTION — the agent's persona, skills and rules. Follow it "
+            "throughout your reasoning and honour it in the voice and content of the "
+            "final answer:\n"
+            f"{self._instructions}\n\n"
+            "--- TASK FRAMEWORK ---\n"
+            f"{base}"
+        )
 
     def _conversation_digest(self, *, limit: int = 20, cap: int = 2000) -> List[Dict[str, str]]:
         """Recent conversation turns, size-bounded for prompt inclusion."""
@@ -160,7 +191,7 @@ class LLMReasoner:
             ]
         prompt = json.dumps(prompt_payload, indent=2)
 
-        text = self.client.generate(prompt, system=system, attachments=attachments)
+        text = self.client.generate(prompt, system=self._system(system), attachments=attachments)
         decision = self._parse_json(text) if text else None
         if not decision:
             self._emit("propose_fallback", step=step.title)
@@ -242,7 +273,7 @@ class LLMReasoner:
         if self._conversation:
             prompt_payload["conversation"] = self._conversation_digest()
         prompt = json.dumps(prompt_payload, indent=2)
-        text = self.client.generate(prompt, system=system)
+        text = self.client.generate(prompt, system=self._system(system))
         decision = self._parse_json(text) if text else None
         steps = (decision or {}).get("steps") if isinstance(decision, dict) else None
         if not isinstance(steps, list) or not steps:
@@ -300,7 +331,7 @@ class LLMReasoner:
         if self._conversation:
             payload["conversation"] = self._conversation_digest()
         prompt = json.dumps(payload, indent=2)
-        text = self.client.generate(prompt, system=system)
+        text = self.client.generate(prompt, system=self._system(system))
         decision = self._parse_json(text) if text else None
         if not isinstance(decision, dict):
             self._emit("synthesize_fallback")
@@ -324,7 +355,7 @@ class LLMReasoner:
             "plan": plan.to_dict(),
             "tool_results": self._memory_digest(memory, roles=("tool_result",)),
         }, indent=2)
-        text = self.client.generate(prompt, system=system)
+        text = self.client.generate(prompt, system=self._system(system))
         decision = self._parse_json(text) if text else None
         if not decision:
             self._emit("reflect_fallback")

@@ -230,8 +230,16 @@ class DavinciAgent:
             setter = getattr(self.reasoner, "set_conversation", None)
             if callable(setter):
                 setter(convo)
+        # Hand the agent's system instruction (its deployed skill / personality)
+        # to reasoners that build their own LLM system prompt. Without this the
+        # skill is only recorded in the trace below and never reaches the model,
+        # so a deployed agent silently ignores the persona it was created with.
+        rendered_instructions = self.instructions.render()
+        instr_setter = getattr(self.reasoner, "set_instructions", None)
+        if callable(instr_setter):
+            instr_setter(rendered_instructions)
         self._record("run_start", f"Starting objective: {objective}",
-                     instructions=self.instructions.render() or None,
+                     instructions=rendered_instructions or None,
                      attachments=[a.to_dict() for a in atts] or None,
                      history_len=len(convo) or None)
         plan = self.planner.plan(objective, required_categories)

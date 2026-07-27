@@ -2,10 +2,9 @@
 
 Rather than depend on a free-text end-of-run synthesis LLM call to re-type a
 value the tools already computed (fragile, and it silently fell back to a
-status string when the model didn't echo the number), Davinci exposes a small
+status string when the model didn't echo the value), Davinci exposes a small
 set of always-registered **terminal** tools:
 
-    result_as_number   value: number
     result_as_text     value: string
     result_as_boolean  value: boolean
     result_as_json     value: object
@@ -17,6 +16,12 @@ tool-use is schema-constrained: the model is forced to hand back a correctly
 typed answer instead of prose. The engine intercepts the call, coerces
 ``value`` into the run's final answer, and ends the run — the answer is then
 signalled back to the requester over the same API that delivered the task.
+
+There is deliberately **no** ``result_as_number`` tool: this is a conversational
+platform, so a numeric answer is delivered as text through the final
+conversational answer (``result_as_text`` or end-of-run synthesis). A dedicated
+number-typed terminal tool added nothing but a brittle coercion that failed
+whenever the model's ``value`` was not a clean number.
 
 This is deliberately orthogonal to the data tools: plugging in a new tool
 (weather, SQL, …) needs no change here, because every task funnels its final
@@ -34,7 +39,6 @@ RESULT_CATEGORY = "result"
 
 # tool name -> the JSON type its ``value`` argument must have
 RESULT_TYPES: Dict[str, str] = {
-    "result_as_number": "number",
     "result_as_text": "string",
     "result_as_boolean": "boolean",
     "result_as_json": "object",
@@ -42,10 +46,8 @@ RESULT_TYPES: Dict[str, str] = {
 }
 
 _DESCRIPTIONS: Dict[str, str] = {
-    "result_as_number": "TERMINAL. Deliver the FINAL answer as a single number. "
-                        "Call this when the objective asks for a numeric result; "
-                        "put the number in `value`. Ends the run.",
-    "result_as_text": "TERMINAL. Deliver the FINAL answer as free text/string. "
+    "result_as_text": "TERMINAL. Deliver the FINAL answer as free text/string — "
+                      "including a numeric answer, stated as text. "
                       "Put the answer in `value`. Ends the run.",
     "result_as_boolean": "TERMINAL. Deliver the FINAL answer as a boolean (true/false). "
                          "Put it in `value`. Ends the run.",
@@ -87,17 +89,6 @@ def register_result_tools(registry: ToolRegistry) -> ToolRegistry:
     return registry
 
 
-def _format_number(v: Any) -> Optional[str]:
-    if isinstance(v, bool):  # bool is an int subclass — reject it as a number
-        return None
-    if isinstance(v, (int, float)):
-        return str(v)
-    try:
-        return str(float(str(v).strip()))
-    except (TypeError, ValueError):
-        return None
-
-
 def coerce_result_value(tool_name: str, args: Any) -> Optional[str]:
     """Turn a terminal tool call's ``args`` into the final-answer string.
 
@@ -110,8 +101,6 @@ def coerce_result_value(tool_name: str, args: Any) -> Optional[str]:
     if value is None:
         return None
     json_type = RESULT_TYPES.get(tool_name, "string")
-    if json_type == "number":
-        return _format_number(value)
     if json_type == "boolean":
         if isinstance(value, bool):
             return "true" if value else "false"

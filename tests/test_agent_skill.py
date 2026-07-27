@@ -298,6 +298,23 @@ def test_engine_hands_rendered_skill_to_reasoner():
     assert "You are the QA agent." in seen.get("instructions", "")
 
 
+def test_no_result_as_number_terminal_tool():
+    """This is a conversational platform: there is no numeric terminal tool — a
+    number is delivered as text through the conversational final answer. The
+    brittle result_as_number (which failed whenever value wasn't a clean number)
+    is removed."""
+    from davinci.mcp import ToolRegistry
+    from davinci.result_tool import RESULT_TYPES, register_result_tools
+
+    reg = register_result_tools(ToolRegistry())
+    assert reg.get("result_as_number") is None
+    assert "result_as_number" not in RESULT_TYPES
+    # The remaining terminal tools stay available.
+    assert reg.get("result_as_text") is not None
+    for name in ("result_as_boolean", "result_as_json", "result_as_list"):
+        assert reg.get(name) is not None
+
+
 def test_wait_for_task_unwraps_client_payload_wrapper():
     # CLI convention: {programId, entity, payload:"<json>"} with the skill
     # and correlation envelope stamped on the wrapper by the node's proxy.

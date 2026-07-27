@@ -151,7 +151,51 @@ def test_reasoner_without_skill_leaves_system_prompt_unprefixed():
     reasoner = LLMReasoner(client)
     reasoner.make_plan("do a thing", [], ToolRegistry())
     plan_system, _ = client.prompts[-1]
-    assert "SYSTEM INSTRUCTION" not in plan_system
+    assert "PERSONA" not in plan_system
+
+
+def test_framework_prompts_do_not_claim_a_fixed_identity():
+    """The task-framework system prompts must not hard-assert a proper-name
+    identity ("You are Davinci…"): with a deployed skill that leaks as the
+    agent's self-description when it is asked who it is (the reported bug — an
+    agent named Tina introduced itself as "Davinci, an enterprise agent
+    planner")."""
+    from davinci.mcp import ToolRegistry
+    from davinci.memory import WorkingMemory
+    from davinci.planning import Plan, PlanStep
+    from davinci.reasoner import LLMReasoner
+
+    client = _CapturingClient('{"complexity": "trivial", "steps": [{"title": "a", "category": "result"}]}')
+    reasoner = LLMReasoner(client)  # no skill set
+
+    reasoner.make_plan("who are you", [], ToolRegistry())
+    client.reply = '{"tool": null, "thought": "x", "final_answer": "hi"}'
+    reasoner.propose("who are you", PlanStep(id=1, title="a", category="result"),
+                     ToolRegistry(), WorkingMemory())
+    client.reply = '{"final_answer": "hi"}'
+    reasoner.set_conversation([{"role": "user", "content": "hi"}])
+    reasoner.synthesize("who are you", Plan(objective="who are you"), WorkingMemory())
+    client.reply = '{"satisfied": true, "critique": "", "replan_titles": []}'
+    reasoner.reflect("who are you", Plan(objective="who are you"), WorkingMemory())
+
+    for system, _ in client.prompts:
+        assert "you are davinci" not in system.lower()
+
+
+def test_skill_is_declared_authoritative_over_default_identity():
+    """With a skill deployed, the persona must be marked as overriding the
+    framework's default role so the model answers identity questions as the
+    persona."""
+    from davinci.mcp import ToolRegistry
+    from davinci.reasoner import LLMReasoner
+
+    client = _CapturingClient('{"complexity": "trivial", "steps": [{"title": "a", "category": "result"}]}')
+    reasoner = LLMReasoner(client)
+    reasoner.set_instructions("You are Tina, a warm concierge who speaks briefly.")
+    reasoner.make_plan("who are you", [], ToolRegistry())
+    system, _ = client.prompts[-1]
+    assert "You are Tina, a warm concierge who speaks briefly." in system
+    assert "OVERRIDES" in system
 
 
 def test_engine_hands_rendered_skill_to_reasoner():

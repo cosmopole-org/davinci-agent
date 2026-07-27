@@ -72,15 +72,27 @@ class LLMReasoner:
     def _system(self, base: str) -> str:
         """Prepend the agent's system instruction to a task-specific system
         prompt so the model reasons and answers in the deployed persona. A no-op
-        when the agent has no skill."""
+        when the agent has no skill.
+
+        The persona is declared *authoritative for identity*: it overrides any
+        default name or role in the task-framework text that follows, so an agent
+        deployed as "Tina" answers "who are you?" as Tina, not as the internal
+        planner. Without this the hardcoded framework identity leaks as the
+        agent's self-description."""
         if not self._instructions:
             return base
         return (
-            "SYSTEM INSTRUCTION — the agent's persona, skills and rules. Follow it "
-            "throughout your reasoning and honour it in the voice and content of the "
-            "final answer:\n"
-            f"{self._instructions}\n\n"
-            "--- TASK FRAMEWORK ---\n"
+            "You ARE the persona defined below. It is your identity, name, voice, "
+            "skills and rules, and it OVERRIDES any default name, role or "
+            "personality mentioned in the task framework that follows. When asked "
+            "who you are or what you do, answer strictly as this persona — never "
+            "introduce yourself by any internal engine, planner or framework name.\n\n"
+            "=== YOUR PERSONA (system instruction) ===\n"
+            f"{self._instructions}\n"
+            "=== END PERSONA ===\n\n"
+            "What follows describes HOW to carry out the task. Follow its mechanics, "
+            "but keep the persona above as your identity and the voice of every "
+            "user-facing answer:\n"
             f"{base}"
         )
 
@@ -157,7 +169,7 @@ class LLMReasoner:
             catalog.append(entry)
         attachments = self._attachments_from_memory(memory)
         system = (
-            "You are Davinci, an enterprise agent planner. For the CURRENT step you "
+            "You are an enterprise agent planner. For the CURRENT step you "
             "pick exactly one registered tool to advance the objective, or no tool for "
             "pure-cognition (analysis/synthesis/verification) steps. Always reply with "
             "a single JSON object: {\"tool\": <tool name or null>, \"args\": {object}, "
@@ -234,7 +246,7 @@ class LLMReasoner:
         categories = sorted({t.get("category", "general") for t in tools} |
                             {"analysis", "verification", "synthesis"})
         system = (
-            "You are Davinci's planner. FIRST judge how much planning the objective "
+            "You are the task planner. FIRST judge how much planning the objective "
             "actually needs, then produce the SMALLEST plan that accomplishes it — "
             "never over-plan. Match the plan's shape to the request:\n"
             "- TRIVIAL (a greeting, a direct question you can answer from your own "
@@ -313,7 +325,7 @@ class LLMReasoner:
         if not results and not self._conversation:
             return None
         system = (
-            "You are Davinci. Produce the FINAL answer to the user's objective using "
+            "Produce the FINAL answer to the user's objective using "
             "the gathered tool results below" +
             (" and the prior conversation" if self._conversation else "") + ". Think "
             "over the data, do any final arithmetic needed, and output the result. "
@@ -345,7 +357,7 @@ class LLMReasoner:
     # -- reflection / replan ------------------------------------------------
     def reflect(self, objective: str, plan: Plan, memory: WorkingMemory) -> Reflection:
         system = (
-            "You are Davinci's reflection critic. Given the objective and the executed "
+            "You are the reflection critic. Given the objective and the executed "
             "plan, decide whether the objective is satisfied. Reply with a single JSON "
             "object: {\"satisfied\": bool, \"critique\": <short string>, "
             "\"replan_titles\": [<step titles to retry/add>]}."

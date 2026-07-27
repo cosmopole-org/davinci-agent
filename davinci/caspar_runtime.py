@@ -34,8 +34,8 @@ import time
 from typing import Any, Dict, List, Optional
 
 from .attachments import Attachment, materialize_attachments
-from .engine import DavinciAgent, EchoExecutor, ToolResult
-from .memory import InstructionMemory
+from .engine import DavinciAgent, EchoExecutor, ToolResult, _normalize_history
+from .memory import InstructionMemory, SessionMemory
 from .mcp import ToolDescriptor, ToolRegistry
 from .result_tool import register_result_tools
 from .observability import Budget, Tracer
@@ -43,6 +43,12 @@ from .permissions import PermissionEngine, PermissionMode, Risk, ToolAction
 
 
 INPUT_DIR = os.environ.get("DAVINCI_INPUT_DIR", "/app/input")
+
+# Per-process conversation cache, keyed by session id (space + target-agent
+# thread upstream). Gives a served run continuity even when the caller does not
+# resend the full history; the orchestrator remains the durable source of truth
+# and can override it by sending an authoritative ``history`` with the task.
+_SESSION_MEMORY = SessionMemory()
 
 
 def _env_flag(name: str, *, default: bool) -> bool:
@@ -273,6 +279,23 @@ class BridgeCreatureExecutor:
         if not delivered:
             return ToolResult(ok=False, output=None, error="tool creature result timed out")
         return ToolResult(ok=True, output={"tool": tool.name, "response": result})
+
+
+def _thread_session_id(task: Dict[str, Any]) -> Optional[str]:
+    """Derive a conversation-thread key from the task's space + target agent.
+
+    Mirrors the orchestrator's threading model: messages sent to the general
+    orbit share a thread per space, while messages directed at a specific agent
+    form that agent's own thread. Used only as the fallback session key when the
+    caller sends no explicit ``session_id`` — it keeps this process's
+    conversation cache from mixing unrelated threads on one gateway connection.
+    """
+    space = task.get("spaceId") or task.get("storeId") or task.get("space_id")
+    if not space:
+        return None
+    target = (task.get("targetAgentId") or task.get("target_agent_id")
+              or task.get("toAgent") or "orbit")
+    return f"space:{space}:{target}"
 
 
 def _read_task() -> Dict[str, Any]:
@@ -529,11 +552,39 @@ def _run_agent(bridge: Any, task: Dict[str, Any], config: Dict[str, Any],
     session_id = (
         task.get("session_id")
         or task.get("sessionId")
+        or _thread_session_id(task)
         or (f"davinci-{bridge.session_id}" if bridge and getattr(bridge, "session_id", None) else "davinci-default")
     )
+
+    # Resolve the conversation for this session. An explicit ``history`` on the
+    # task is authoritative (the orchestrator owns per-agent targeting); absent
+    # that, fall back to what this process has cached for the thread. Either way
+    # the run is conducted with the prior turns as context.
+    raw_history = task.get("history") or task.get("messages") or task.get("conversation")
+    convo = _normalize_history(raw_history if isinstance(raw_history, list) else None)
+    if convo:
+        _SESSION_MEMORY.replace(session_id, convo)
+    else:
+        convo = _SESSION_MEMORY.messages(session_id)
+    # A stray trailing user turn identical to the objective (a race where the
+    # current prompt was already persisted into history) would double-seed it;
+    # drop it so ``objective`` is the sole current turn.
+    if convo and convo[-1].get("role") == "user" and convo[-1].get("content", "").strip() == objective.strip():
+        convo = convo[:-1]
+    if convo:
+        print("DAVINCI_CONVERSATION " + json.dumps(
+            {"session": session_id, "turns": len(convo)}), flush=True)
+
     with _SessionSandbox(bridge, sandbox_enabled, session_id):
         result = agent.run(objective, required_categories=required,
-                           attachments=attachments)
+                           attachments=attachments, history=convo)
+
+    # Record this turn so the next prompt on the same session has continuity even
+    # if the caller sends no history next time.
+    _SESSION_MEMORY.append(session_id, "user", objective)
+    if isinstance(result.answer, str) and result.answer.strip():
+        _SESSION_MEMORY.append(session_id, "assistant", result.answer)
+
     result_dict = result.to_dict()
     print("DAVINCI_RESULT " + json.dumps(result_dict), flush=True)
     return result, result_dict

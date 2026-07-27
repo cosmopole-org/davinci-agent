@@ -274,12 +274,21 @@ class DavinciAgent:
                 break
 
         success = plan.is_complete and not plan.has_failures and self.budget.exceeded() is None
-        # Final answer: prefer a full-context synthesis over the whole run (the
-        # reasoner aggregates every untruncated tool result and honours the
-        # objective's output-format constraint). Fall back to any step answer,
-        # then to a deterministic summary.
-        final = self._final_answer(objective, plan)
-        answer = final or answer or self._synthesize(objective, plan)
+        # Resolve the final answer.
+        #
+        # A terminal *result* tool already delivered the precise, typed answer —
+        # keep it verbatim (synthesis must not paraphrase a typed result). For
+        # every other run — a tool-driven objective with no explicit result tool,
+        # OR a purely conversational turn with no tools at all — ask the reasoner
+        # to synthesise the final, user-facing answer (it answers conversational
+        # prompts directly, in persona, instead of forcing tool talk). The
+        # deterministic step summary is only a last resort when no LLM reasoner is
+        # wired, so a plain "How are you?" never surfaces as "Completed N steps".
+        if self._final_delivered and isinstance(answer, str) and answer.strip():
+            pass
+        else:
+            final = self._final_answer(objective, plan)
+            answer = final or answer or self._synthesize(objective, plan)
         self._record("run_end", "Run complete", success=success, answer=answer)
         return RunResult(
             objective=objective,

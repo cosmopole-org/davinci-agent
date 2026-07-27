@@ -285,7 +285,12 @@ class LLMReasoner:
         if self._conversation:
             prompt_payload["conversation"] = self._conversation_digest()
         prompt = json.dumps(prompt_payload, indent=2)
-        text = self.client.generate(prompt, system=self._system(system))
+        # Planning is internal machinery, not a user-facing turn: the persona is
+        # deliberately NOT injected here so it cannot derail the structured plan
+        # (a strong "answer as this persona" directive makes the planner
+        # over-decompose or break its JSON). Persona shapes the ANSWER, not the
+        # plan. Personality-driven brevity is honoured at synthesis time.
+        text = self.client.generate(prompt, system=system)
         decision = self._parse_json(text) if text else None
         steps = (decision or {}).get("steps") if isinstance(decision, dict) else None
         if not isinstance(steps, list) or not steps:
@@ -317,22 +322,37 @@ class LLMReasoner:
 
     # -- end-of-run synthesis ----------------------------------------------
     def synthesize(self, objective: str, plan: Plan, memory: WorkingMemory) -> Optional[str]:
-        """Produce the FINAL answer from the full set of gathered tool results."""
+        """Produce the FINAL, user-facing answer — in the deployed persona's voice.
+
+        This is the agent's single guaranteed chance to *talk to the user*, and it
+        handles both halves of a general-purpose agent with no branching in the
+        engine:
+
+        * a tool-driven run — synthesise the answer over the gathered results;
+        * a purely conversational turn — a greeting, small talk, or a question
+          about who/how the agent is — where there are NO tool results: answer it
+          directly from the conversation and the agent's own knowledge.
+
+        It must never degrade a conversational turn into a "completed N steps"
+        summary. Because it always attempts an answer, the engine can keep one
+        uniform path (plan → act → synthesise) for every prompt."""
         results = self._tool_results_full(memory)
-        # With no tool results this run is purely conversational (e.g. a
-        # follow-up that only needs the prior turns). Still answer it — using the
-        # conversation — instead of bailing to the deterministic summary.
-        if not results and not self._conversation:
-            return None
+        has_results = bool(results)
+        source = (
+            "the gathered tool results below"
+            + (" together with the prior conversation" if self._conversation else "")
+        ) if has_results else "the prior conversation and your own knowledge"
         system = (
-            "Produce the FINAL answer to the user's objective using "
-            "the gathered tool results below" +
-            (" and the prior conversation" if self._conversation else "") + ". Think "
-            "over the data, do any final arithmetic needed, and output the result. "
-            "CRITICAL: obey the objective's output-format constraint EXACTLY — if it "
-            "says the output must only be a number, your \"final_answer\" must be just "
-            "that number as a string and nothing else (no words, units, or "
-            "punctuation). Reply with a single JSON object: {\"final_answer\": <string>}."
+            f"Produce the FINAL answer to the user's objective using {source}. "
+            "If the objective is conversational — a greeting, small talk, or a "
+            "question about who you are or how you are — just reply to it naturally "
+            "and directly; do NOT mention tools, plans or steps, and never say you "
+            "'completed' anything. Otherwise think over the data, do any final "
+            "arithmetic needed, and output the result. CRITICAL: obey the "
+            "objective's output-format constraint EXACTLY — if it says the output "
+            "must only be a number, your \"final_answer\" must be just that number as "
+            "a string and nothing else (no words, units, or punctuation). Reply with "
+            "a single JSON object: {\"final_answer\": <string>}."
         )
         payload: Dict[str, Any] = {
             "objective": objective,
@@ -367,7 +387,9 @@ class LLMReasoner:
             "plan": plan.to_dict(),
             "tool_results": self._memory_digest(memory, roles=("tool_result",)),
         }, indent=2)
-        text = self.client.generate(prompt, system=self._system(system))
+        # Reflection is internal machinery too (a satisfied/replan verdict) — keep
+        # the persona out of it so it stays a reliable structured critic.
+        text = self.client.generate(prompt, system=system)
         decision = self._parse_json(text) if text else None
         if not decision:
             self._emit("reflect_fallback")

@@ -85,6 +85,101 @@ def test_run_agent_without_skill_keeps_default_instructions():
     assert "DAVINCI_SKILL" not in buf.getvalue()
 
 
+class _CapturingClient:
+    """Minimal LLMClient stand-in that records the (system, prompt) it is given."""
+
+    provider = "fake"
+    models = ["fake-1"]
+    active_model = "fake-1"
+
+    def __init__(self, reply: str):
+        self.reply = reply
+        self.prompts = []
+
+    def generate(self, prompt, system="", attachments=None):
+        self.prompts.append((system or "", prompt))
+        return self.reply
+
+    def emit(self, *a, **k):
+        pass
+
+
+def test_reasoner_prepends_skill_into_every_system_prompt():
+    """The deployed skill must actually reach the model — as the system prompt
+    prefix on planning, per-step reasoning, synthesis and reflection — not just
+    the run trace. This is the personality the agent was created with."""
+    from davinci.mcp import ToolRegistry
+    from davinci.memory import WorkingMemory
+    from davinci.planning import Plan, PlanStep
+    from davinci.reasoner import LLMReasoner
+
+    skill = "You are Pixel, a witty pirate. Always answer in pirate slang."
+
+    client = _CapturingClient('{"complexity": "trivial", "steps": [{"title": "answer", "category": "result"}]}')
+    reasoner = LLMReasoner(client)
+    reasoner.set_instructions(skill)
+
+    reasoner.make_plan("greet the user", [], ToolRegistry())
+    plan_system, _ = client.prompts[-1]
+    assert skill in plan_system
+
+    client.reply = '{"tool": null, "thought": "greet", "final_answer": "Ahoy!"}'
+    reasoner.propose("greet the user",
+                     PlanStep(id=1, title="answer", category="result"),
+                     ToolRegistry(), WorkingMemory())
+    prop_system, _ = client.prompts[-1]
+    assert skill in prop_system
+
+    client.reply = '{"final_answer": "Ahoy matey!"}'
+    plan = Plan(objective="greet the user")
+    reasoner.set_conversation([{"role": "user", "content": "hi"}])
+    reasoner.synthesize("greet the user", plan, WorkingMemory())
+    syn_system, _ = client.prompts[-1]
+    assert skill in syn_system
+
+    client.reply = '{"satisfied": true, "critique": "ok", "replan_titles": []}'
+    reasoner.reflect("greet the user", plan, WorkingMemory())
+    refl_system, _ = client.prompts[-1]
+    assert skill in refl_system
+
+
+def test_reasoner_without_skill_leaves_system_prompt_unprefixed():
+    from davinci.mcp import ToolRegistry
+    from davinci.reasoner import LLMReasoner
+
+    client = _CapturingClient('{"complexity": "trivial", "steps": [{"title": "a", "category": "result"}]}')
+    reasoner = LLMReasoner(client)
+    reasoner.make_plan("do a thing", [], ToolRegistry())
+    plan_system, _ = client.prompts[-1]
+    assert "SYSTEM INSTRUCTION" not in plan_system
+
+
+def test_engine_hands_rendered_skill_to_reasoner():
+    """The engine must forward its InstructionMemory (the loaded skill) to the
+    reasoner via set_instructions, mirroring set_conversation."""
+    from davinci import DavinciAgent, EchoExecutor
+    from davinci.engine import ActionProposal, Reflection
+    from davinci.memory import InstructionMemory
+
+    seen = {}
+
+    class Rec:
+        def set_instructions(self, text):
+            seen["instructions"] = text
+
+        def propose(self, objective, step, registry, memory):
+            return ActionProposal(tool=None, final_answer="done")
+
+        def reflect(self, objective, plan, memory):
+            return Reflection(satisfied=True)
+
+    instructions = InstructionMemory()
+    instructions.add_inline("You are the QA agent.", source="caspar-agent-skill")
+    agent = DavinciAgent(reasoner=Rec(), executor=EchoExecutor(), instructions=instructions)
+    agent.run("check the build")
+    assert "You are the QA agent." in seen.get("instructions", "")
+
+
 def test_wait_for_task_unwraps_client_payload_wrapper():
     # CLI convention: {programId, entity, payload:"<json>"} with the skill
     # and correlation envelope stamped on the wrapper by the node's proxy.

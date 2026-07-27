@@ -36,6 +36,45 @@ from .result_tool import coerce_result_value
 # Pluggable protocols
 # ---------------------------------------------------------------------------
 
+# Canonical conversation roles Davinci reasons over. Upstream systems label the
+# assistant side "agent" (Decillion) or "assistant" (OpenAI-style); normalize to
+# one vocabulary so the reasoner prompts stay consistent across callers.
+_ROLE_ALIASES = {
+    "user": "user", "human": "user",
+    "assistant": "assistant", "agent": "assistant", "ai": "assistant", "bot": "assistant",
+    "system": "system", "developer": "system",
+}
+
+
+def _normalize_history(history: Optional[List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
+    """Coerce a raw message list into ``[{role, content, agentName?}]``.
+
+    Tolerant of the shapes different callers emit: ``role``/``from``/``sender``
+    for the speaker and ``content``/``text``/``message`` for the body. Entries
+    without any text are dropped. Never raises — a malformed history must not
+    break a run.
+    """
+    out: List[Dict[str, Any]] = []
+    for item in history or []:
+        if not isinstance(item, dict):
+            continue
+        raw_role = str(item.get("role") or item.get("from") or item.get("sender") or "user").lower()
+        role = _ROLE_ALIASES.get(raw_role, "user")
+        content = item.get("content")
+        if content is None:
+            content = item.get("text") or item.get("message") or item.get("answer") or ""
+        text = content if isinstance(content, str) else str(content)
+        text = text.strip()
+        if not text:
+            continue
+        entry: Dict[str, Any] = {"role": role, "content": text}
+        name = item.get("agentName") or item.get("agent") or item.get("name")
+        if isinstance(name, str) and name.strip():
+            entry["agentName"] = name.strip()
+        out.append(entry)
+    return out
+
+
 @dataclass
 class ActionProposal:
     """What the reasoner wants to do for a step."""
@@ -164,7 +203,8 @@ class DavinciAgent:
     # -- public API ----------------------------------------------------------
     def run(self, objective: str, required_categories: Optional[List[str]] = None,
             replan_budget: int = 1,
-            attachments: Optional[List[Attachment]] = None) -> RunResult:
+            attachments: Optional[List[Attachment]] = None,
+            history: Optional[List[Dict[str, Any]]] = None) -> RunResult:
         # Multimodal attachments accompanying the user prompt: surface them on
         # the working memory so reasoners that understand multimodal input
         # (e.g. LLMReasoner) can attach them to their LLM calls. The
@@ -177,9 +217,23 @@ class DavinciAgent:
             self.working.set_fact("attachments", atts)
             self.working.remember("user_attachments",
                                   [a.to_dict() for a in atts])
+        # Prior conversation for this session (bound to a Decillion space +
+        # target agent upstream). Seeding it makes Davinci conversation-based:
+        # the reasoner sees earlier turns and can resolve references like "it" /
+        # "that" and answer follow-ups coherently instead of one-shot.
+        convo = _normalize_history(history)
+        if convo:
+            self.working.set_fact("conversation", convo)
+            for msg in convo:
+                self.working.remember(msg["role"], msg["content"])
+            # Hand the conversation to reasoners that plan/synthesize with it.
+            setter = getattr(self.reasoner, "set_conversation", None)
+            if callable(setter):
+                setter(convo)
         self._record("run_start", f"Starting objective: {objective}",
                      instructions=self.instructions.render() or None,
-                     attachments=[a.to_dict() for a in atts] or None)
+                     attachments=[a.to_dict() for a in atts] or None,
+                     history_len=len(convo) or None)
         plan = self.planner.plan(objective, required_categories)
         self._record("plan", "Generated execution plan", plan=plan.to_dict())
 

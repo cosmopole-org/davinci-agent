@@ -36,7 +36,7 @@ from .llm import (
     make_client,
 )
 from .mcp import ToolDescriptor, ToolRegistry
-from .memory import EpisodicMemory, InstructionMemory, WorkingMemory, compact_messages
+from .memory import EpisodicMemory, InstructionMemory, SessionMemory, WorkingMemory, compact_messages
 from .observability import Budget, Tracer, mask_secrets
 from .reasoner import LLMReasoner, reasoner_from_config
 from .permissions import Decision, Outcome, PermissionEngine, PermissionMode, Risk, ToolAction
@@ -48,7 +48,7 @@ __all__ = [
     "DavinciAgent", "RunResult", "ToolExecutor", "ToolResult", "ActionProposal",
     "HeuristicReasoner", "EchoExecutor", "Reflection",
     "ToolRegistry", "ToolDescriptor",
-    "WorkingMemory", "EpisodicMemory", "InstructionMemory", "compact_messages",
+    "WorkingMemory", "EpisodicMemory", "InstructionMemory", "SessionMemory", "compact_messages",
     "Tracer", "Budget", "mask_secrets",
     "PermissionEngine", "PermissionMode", "Risk", "Outcome", "Decision", "ToolAction",
     "Plan", "Planner", "PlanStep", "StepStatus",

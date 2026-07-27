@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import os
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional
@@ -160,6 +161,70 @@ class InstructionMemory:
     @property
     def blocks(self) -> List[Dict[str, str]]:
         return list(self._blocks)
+
+
+# ---------------------------------------------------------------------------
+# Session memory (per-session conversation)
+# ---------------------------------------------------------------------------
+
+class SessionMemory:
+    """Bounded, in-process store of the conversation for each session.
+
+    A davinci creature serves many sessions sequentially (one per space +
+    target-agent thread upstream). This keeps the rolling message list for each
+    so a run has conversational continuity even when the caller does not resend
+    the full history. When the caller *does* supply the authoritative history
+    (the orchestrator that owns targeting), :meth:`replace` adopts it verbatim.
+
+    State is intentionally in-memory only: the durable, targeting-aware record
+    lives in the orchestrator; this is a per-process cache, not the source of
+    truth.
+    """
+
+    def __init__(self, max_messages: int = 100, max_sessions: int = 512) -> None:
+        self.max_messages = max_messages
+        self.max_sessions = max_sessions
+        self._sessions: "OrderedDict[str, List[Dict[str, Any]]]" = OrderedDict()
+
+    def _touch(self, session_id: str) -> List[Dict[str, Any]]:
+        msgs = self._sessions.pop(session_id, None)
+        if msgs is None:
+            msgs = []
+        self._sessions[session_id] = msgs  # move-to-end (most-recently-used)
+        while len(self._sessions) > self.max_sessions:
+            self._sessions.popitem(last=False)  # evict least-recently-used
+        return msgs
+
+    def messages(self, session_id: str) -> List[Dict[str, Any]]:
+        return [dict(m) for m in self._sessions.get(session_id, [])]
+
+    def append(self, session_id: str, role: str, content: str,
+               agent_name: Optional[str] = None) -> None:
+        text = (content or "").strip()
+        if not text:
+            return
+        msgs = self._touch(session_id)
+        entry: Dict[str, Any] = {"role": role, "content": text}
+        if agent_name:
+            entry["agentName"] = agent_name
+        msgs.append(entry)
+        if len(msgs) > self.max_messages:
+            del msgs[: len(msgs) - self.max_messages]
+
+    def replace(self, session_id: str, history: Iterable[Dict[str, Any]]) -> None:
+        """Adopt an authoritative message list for a session (bounded)."""
+        cleaned = [
+            {k: v for k, v in m.items() if k in ("role", "content", "agentName")}
+            for m in (history or [])
+            if isinstance(m, dict) and str(m.get("content") or "").strip()
+        ]
+        self._sessions.pop(session_id, None)
+        self._sessions[session_id] = cleaned[-self.max_messages:]
+        while len(self._sessions) > self.max_sessions:
+            self._sessions.popitem(last=False)
+
+    def clear(self, session_id: str) -> None:
+        self._sessions.pop(session_id, None)
 
 
 # ---------------------------------------------------------------------------

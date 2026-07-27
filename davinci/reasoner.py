@@ -37,6 +37,29 @@ class LLMReasoner:
     def __init__(self, client: LLMClient) -> None:
         self.client = client
         self._fallback = HeuristicReasoner()
+        # Prior turns of this session's conversation, seeded by the engine at the
+        # start of a run (see ``DavinciAgent.run(history=...)``). Empty for a
+        # fresh one-shot prompt.
+        self._conversation: List[Dict[str, str]] = []
+
+    # -- conversation --------------------------------------------------------
+    def set_conversation(self, history: List[Dict[str, Any]]) -> None:
+        """Adopt the session's prior messages so planning, per-step reasoning,
+        and final synthesis are all conducted with conversational context."""
+        self._conversation = [
+            {"role": str(m.get("role") or "user"),
+             "content": str(m.get("content") or "")}
+            for m in (history or [])
+            if isinstance(m, dict) and str(m.get("content") or "").strip()
+        ]
+
+    def _conversation_digest(self, *, limit: int = 20, cap: int = 2000) -> List[Dict[str, str]]:
+        """Recent conversation turns, size-bounded for prompt inclusion."""
+        digest: List[Dict[str, str]] = []
+        for m in self._conversation[-limit:]:
+            text = m.get("content", "")
+            digest.append({"role": m.get("role", "user"), "content": text[:cap]})
+        return digest
 
     # -- pass-through identity (used by the runtime for capability reporting) --
     @property
@@ -127,6 +150,8 @@ class LLMReasoner:
             "available_tools": catalog,
             "recent_memory": self._memory_digest(memory),
         }
+        if self._conversation:
+            prompt_payload["conversation"] = self._conversation_digest()
         if attachments:
             prompt_payload["attachments"] = [
                 {"name": a.name, "mime_type": a.mime_type, "size": a.size,
@@ -202,11 +227,21 @@ class LLMReasoner:
             "\"trivial\"|\"simple\"|\"complex\", \"steps\": [{\"title\": str, "
             "\"category\": str, \"rationale\": str}, ...]}."
         )
-        prompt = json.dumps({
+        if self._conversation:
+            system += (
+                " This objective is the latest turn of an ONGOING conversation "
+                "(prior turns are provided as \"conversation\"). Interpret it in "
+                "that context — resolve references to earlier turns (\"it\", "
+                "\"that\", \"the same\") and do not re-do work already answered."
+            )
+        prompt_payload: Dict[str, Any] = {
             "objective": objective,
             "available_categories": categories,
             "available_tools": tools,
-        }, indent=2)
+        }
+        if self._conversation:
+            prompt_payload["conversation"] = self._conversation_digest()
+        prompt = json.dumps(prompt_payload, indent=2)
         text = self.client.generate(prompt, system=system)
         decision = self._parse_json(text) if text else None
         steps = (decision or {}).get("steps") if isinstance(decision, dict) else None
@@ -241,23 +276,30 @@ class LLMReasoner:
     def synthesize(self, objective: str, plan: Plan, memory: WorkingMemory) -> Optional[str]:
         """Produce the FINAL answer from the full set of gathered tool results."""
         results = self._tool_results_full(memory)
-        if not results:
+        # With no tool results this run is purely conversational (e.g. a
+        # follow-up that only needs the prior turns). Still answer it — using the
+        # conversation — instead of bailing to the deterministic summary.
+        if not results and not self._conversation:
             return None
         system = (
             "You are Davinci. Produce the FINAL answer to the user's objective using "
-            "ONLY the gathered tool results below. Think over the data, do any final "
-            "arithmetic needed, and output the result. CRITICAL: obey the objective's "
-            "output-format constraint EXACTLY — if it says the output must only be a "
-            "number, your \"final_answer\" must be just that number as a string and "
-            "nothing else (no words, units, or punctuation). Reply with a single JSON "
-            "object: {\"final_answer\": <string>}."
+            "the gathered tool results below" +
+            (" and the prior conversation" if self._conversation else "") + ". Think "
+            "over the data, do any final arithmetic needed, and output the result. "
+            "CRITICAL: obey the objective's output-format constraint EXACTLY — if it "
+            "says the output must only be a number, your \"final_answer\" must be just "
+            "that number as a string and nothing else (no words, units, or "
+            "punctuation). Reply with a single JSON object: {\"final_answer\": <string>}."
         )
-        prompt = json.dumps({
+        payload: Dict[str, Any] = {
             "objective": objective,
             "tool_results": results,
             "steps": [{"title": s.title, "status": s.status.value, "result": s.result}
                       for s in plan.steps],
-        }, indent=2)
+        }
+        if self._conversation:
+            payload["conversation"] = self._conversation_digest()
+        prompt = json.dumps(payload, indent=2)
         text = self.client.generate(prompt, system=system)
         decision = self._parse_json(text) if text else None
         if not isinstance(decision, dict):

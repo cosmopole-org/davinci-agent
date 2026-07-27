@@ -105,9 +105,11 @@ class _CapturingClient:
 
 
 def test_reasoner_prepends_skill_into_every_system_prompt():
-    """The deployed skill must actually reach the model — as the system prompt
-    prefix on planning, per-step reasoning, synthesis and reflection — not just
-    the run trace. This is the personality the agent was created with."""
+    """The deployed skill must reach the model on the USER-FACING generation
+    calls — per-step reasoning (which can deliver the answer) and final synthesis
+    — so the answer carries the persona. It must NOT be injected into the
+    internal planner / reflection critic, which are structured machinery the
+    persona would derail."""
     from davinci.mcp import ToolRegistry
     from davinci.memory import WorkingMemory
     from davinci.planning import Plan, PlanStep
@@ -119,10 +121,7 @@ def test_reasoner_prepends_skill_into_every_system_prompt():
     reasoner = LLMReasoner(client)
     reasoner.set_instructions(skill)
 
-    reasoner.make_plan("greet the user", [], ToolRegistry())
-    plan_system, _ = client.prompts[-1]
-    assert skill in plan_system
-
+    # Answer-generating calls carry the persona.
     client.reply = '{"tool": null, "thought": "greet", "final_answer": "Ahoy!"}'
     reasoner.propose("greet the user",
                      PlanStep(id=1, title="answer", category="result"),
@@ -137,21 +136,30 @@ def test_reasoner_prepends_skill_into_every_system_prompt():
     syn_system, _ = client.prompts[-1]
     assert skill in syn_system
 
+    # Internal machinery stays persona-free so its structured output is reliable.
+    client.reply = '{"complexity": "trivial", "steps": [{"title": "answer", "category": "result"}]}'
+    reasoner.make_plan("greet the user", [], ToolRegistry())
+    plan_system, _ = client.prompts[-1]
+    assert skill not in plan_system
+
     client.reply = '{"satisfied": true, "critique": "ok", "replan_titles": []}'
     reasoner.reflect("greet the user", plan, WorkingMemory())
     refl_system, _ = client.prompts[-1]
-    assert skill in refl_system
+    assert skill not in refl_system
 
 
-def test_reasoner_without_skill_leaves_system_prompt_unprefixed():
+def test_planner_and_critic_stay_persona_free():
     from davinci.mcp import ToolRegistry
+    from davinci.memory import WorkingMemory
+    from davinci.planning import Plan
     from davinci.reasoner import LLMReasoner
 
     client = _CapturingClient('{"complexity": "trivial", "steps": [{"title": "a", "category": "result"}]}')
     reasoner = LLMReasoner(client)
+    reasoner.set_instructions("You are Tina, a warm concierge.")
     reasoner.make_plan("do a thing", [], ToolRegistry())
     plan_system, _ = client.prompts[-1]
-    assert "PERSONA" not in plan_system
+    assert "PERSONA" not in plan_system and "Tina" not in plan_system
 
 
 def test_framework_prompts_do_not_claim_a_fixed_identity():
@@ -183,19 +191,85 @@ def test_framework_prompts_do_not_claim_a_fixed_identity():
 
 
 def test_skill_is_declared_authoritative_over_default_identity():
-    """With a skill deployed, the persona must be marked as overriding the
-    framework's default role so the model answers identity questions as the
-    persona."""
-    from davinci.mcp import ToolRegistry
+    """With a skill deployed, the answer-generating prompt must mark the persona
+    as overriding the framework's default role so the model answers identity
+    questions as the persona."""
+    from davinci.memory import WorkingMemory
+    from davinci.planning import Plan
     from davinci.reasoner import LLMReasoner
 
-    client = _CapturingClient('{"complexity": "trivial", "steps": [{"title": "a", "category": "result"}]}')
+    client = _CapturingClient('{"final_answer": "I am Tina."}')
     reasoner = LLMReasoner(client)
     reasoner.set_instructions("You are Tina, a warm concierge who speaks briefly.")
-    reasoner.make_plan("who are you", [], ToolRegistry())
+    reasoner.synthesize("who are you", Plan(objective="who are you"), WorkingMemory())
     system, _ = client.prompts[-1]
     assert "You are Tina, a warm concierge who speaks briefly." in system
     assert "OVERRIDES" in system
+
+
+def test_conversational_prompt_gets_spoken_answer_not_step_summary():
+    """A greeting/identity/small-talk prompt must yield a real spoken answer,
+    never the deterministic "Completed N/M steps" summary. synthesize answers it
+    directly even with no tools or tool results."""
+    from davinci import DavinciAgent, EchoExecutor
+    from davinci.engine import ActionProposal, Reflection
+
+    class ChatReasoner:
+        """LLM stand-in: no tool for any step, always answers via synthesize."""
+
+        def set_instructions(self, text):
+            self._instr = text
+
+        def set_conversation(self, history):
+            pass
+
+        def propose(self, objective, step, registry, memory):
+            return ActionProposal(tool=None, thought="conversational")
+
+        def reflect(self, objective, plan, memory):
+            return Reflection(satisfied=True)
+
+        def synthesize(self, objective, plan, memory):
+            return "I'm doing wonderfully — I'm Tina, happy to help!"
+
+    agent = DavinciAgent(reasoner=ChatReasoner(), executor=EchoExecutor())
+    result = agent.run("How are you?")
+    assert result.answer == "I'm doing wonderfully — I'm Tina, happy to help!"
+    assert "Completed" not in result.answer
+
+
+def test_terminal_result_answer_is_not_overridden_by_synthesis():
+    """When a terminal result tool delivers a precise typed answer, the engine
+    keeps it verbatim and does NOT let synthesis paraphrase it."""
+    from davinci import DavinciAgent, EchoExecutor
+    from davinci.engine import ActionProposal, Reflection
+    from davinci.mcp import ToolRegistry
+    from davinci.result_tool import register_result_tools
+
+    registry = register_result_tools(ToolRegistry())
+
+    class ResultReasoner:
+        def set_instructions(self, text):
+            pass
+
+        def set_conversation(self, history):
+            pass
+
+        def propose(self, objective, step, registry, memory):
+            tool = registry.get("result_as_text")
+            if tool is not None:
+                return ActionProposal(tool=tool, args={"value": "42"}, thought="deliver")
+            return ActionProposal(tool=None, final_answer=None)
+
+        def reflect(self, objective, plan, memory):
+            return Reflection(satisfied=True)
+
+        def synthesize(self, objective, plan, memory):
+            return "SYNTHESIZED OVERRIDE"
+
+    agent = DavinciAgent(registry=registry, reasoner=ResultReasoner(), executor=EchoExecutor())
+    result = agent.run("give me the number")
+    assert result.answer == "42"
 
 
 def test_engine_hands_rendered_skill_to_reasoner():

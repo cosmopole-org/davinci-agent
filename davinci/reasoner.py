@@ -46,17 +46,82 @@ class LLMReasoner:
         # to every LLM system prompt so the model actually adopts the persona —
         # empty for an agent deployed without a skill.
         self._instructions: str = ""
+        # Group-chat context: this agent's own identity, the roster of the other
+        # participants (agents + people) in the space, and whether the current
+        # conversation is a shared group chat. Seeded by the runtime via
+        # ``set_group_context``. Empty for a plain one-shot prompt.
+        self._self_identity: Dict[str, str] = {}
+        self._roster: List[Dict[str, str]] = []
+        self._group_chat: bool = False
 
     # -- conversation --------------------------------------------------------
     def set_conversation(self, history: List[Dict[str, Any]]) -> None:
         """Adopt the session's prior messages so planning, per-step reasoning,
-        and final synthesis are all conducted with conversational context."""
-        self._conversation = [
-            {"role": str(m.get("role") or "user"),
-             "content": str(m.get("content") or "")}
-            for m in (history or [])
-            if isinstance(m, dict) and str(m.get("content") or "").strip()
-        ]
+        and final synthesis are all conducted with conversational context.
+
+        Group-chat annotations (``from`` / ``to`` / ``directedToMe``) are kept so
+        the digest can show who each turn was from and who it was aimed at."""
+        kept: List[Dict[str, Any]] = []
+        for m in history or []:
+            if not isinstance(m, dict) or not str(m.get("content") or "").strip():
+                continue
+            entry: Dict[str, Any] = {
+                "role": str(m.get("role") or "user"),
+                "content": str(m.get("content") or ""),
+            }
+            if isinstance(m.get("from"), str) and m["from"].strip():
+                entry["from"] = m["from"].strip()
+            if isinstance(m.get("to"), list) and m["to"]:
+                entry["to"] = m["to"]
+            if m.get("directedToMe"):
+                entry["directedToMe"] = True
+            kept.append(entry)
+        self._conversation = kept
+
+    # -- group chat awareness ------------------------------------------------
+    def set_group_context(
+        self,
+        *,
+        self_identity: Optional[Dict[str, Any]] = None,
+        roster: Optional[List[Dict[str, Any]]] = None,
+        group_chat: bool = False,
+    ) -> None:
+        """Adopt the shared-space context: who this agent is, who else is in the
+        space, and that the conversation is a multi-participant group chat.
+
+        This is what lets a deployed agent behave correctly in a decoupled team
+        thread — it knows its own name, recognises the other agents/people,
+        understands that some turns are directed at it and some are not, and
+        knows how to pull another participant in (by @mention) when it needs
+        something from them."""
+        ident: Dict[str, str] = {}
+        if isinstance(self_identity, dict):
+            for k in ("name", "handle", "id"):
+                v = self_identity.get(k)
+                if isinstance(v, str) and v.strip():
+                    ident[k] = v.strip()
+        self._self_identity = ident
+
+        # Anything that identifies this agent, so it is never listed among the
+        # "other participants" (the roster the orchestrator sends includes every
+        # agent, this one included).
+        me_keys = {ident[k].lower() for k in ("id", "handle", "name") if ident.get(k)}
+
+        people: List[Dict[str, str]] = []
+        for r in roster or []:
+            if not isinstance(r, dict):
+                continue
+            rid = str(r.get("id") or "").strip()
+            name = str(r.get("name") or r.get("label") or "").strip()
+            handle = str(r.get("handle") or "").strip()
+            kind = "user" if r.get("kind") == "user" else "agent"
+            if not (name or handle):
+                continue
+            if kind == "agent" and me_keys & {v.lower() for v in (rid, name, handle) if v}:
+                continue  # this is me — don't list myself as a peer
+            people.append({"id": rid, "name": name or handle, "handle": handle, "kind": kind})
+        self._roster = people
+        self._group_chat = bool(group_chat or people or ident)
 
     # -- system instruction (deployed skill / personality) ------------------
     def set_instructions(self, text: Optional[str]) -> None:
@@ -79,9 +144,11 @@ class LLMReasoner:
         deployed as "Tina" answers "who are you?" as Tina, not as the internal
         planner. Without this the hardcoded framework identity leaks as the
         agent's self-description."""
+        group = self._group_preamble()
         if not self._instructions:
-            return base
+            return f"{group}{base}" if group else base
         return (
+            f"{group}"
             "You ARE the persona defined below. It is your identity, name, voice, "
             "skills and rules, and it OVERRIDES any default name, role or "
             "personality mentioned in the task framework that follows. When asked "
@@ -96,13 +163,97 @@ class LLMReasoner:
             f"{base}"
         )
 
+    def _group_preamble(self) -> str:
+        """A system section describing the group-chat setup: this agent's own
+        identity, the roster of other participants, and the @mention protocol.
+
+        Returns an empty string outside a group chat, so one-shot prompts are
+        unaffected."""
+        if not self._group_chat and not self._roster and not self._self_identity:
+            return ""
+        me = self._self_identity
+        my_name = me.get("name") or "this agent"
+        my_handle = me.get("handle")
+        who = f"You are \"{my_name}\""
+        if my_handle:
+            who += f" (your @handle is @{my_handle})"
+        who += "."
+
+        lines: List[str] = []
+        for r in self._roster:
+            if me and r.get("handle") and me.get("handle") and r["handle"] == me["handle"]:
+                continue  # don't list yourself
+            label = r.get("name") or r.get("handle") or "participant"
+            handle = f" — @{r['handle']}" if r.get("handle") else ""
+            kind = "agent" if r.get("kind") == "agent" else "person"
+            lines.append(f"  • {label}{handle} ({kind})")
+        roster_block = (
+            "The other participants in this space are:\n" + "\n".join(lines) + "\n"
+            if lines else ""
+        )
+
+        return (
+            "=== GROUP CHAT ===\n"
+            "You are one participant in a shared, multi-party group chat with "
+            "several agents and people. " + who + "\n"
+            + roster_block +
+            "How this conversation works:\n"
+            "  • Every message is visible to everyone, but a message is only "
+            "*directed* at the participants it @mentions. Prior turns are "
+            "annotated with who they were From and who they were directed To; a "
+            "turn marked \"(directed at you)\" is addressed to you, others you are "
+            "only overhearing.\n"
+            "  • You were triggered because the latest turn is directed at you. "
+            "Respond to it in your own voice.\n"
+            "  • To hand work to, ask something of, or bring in another agent or "
+            "person, @mention their handle (e.g. @some-agent) in your reply — that "
+            "is what notifies and triggers them. Only @mention someone when you "
+            "actually need something from them.\n"
+            "  • If a message is merely acknowledging you or thanking you and you "
+            "have nothing further to add, do NOT keep the loop going: reply "
+            "briefly WITHOUT @mentioning the sender (an @mention would re-trigger "
+            "them and bounce the conversation back and forth forever).\n"
+            "  • Do not @mention yourself, and do not repeat another participant's "
+            "answer as if it were your own.\n"
+            "=== END GROUP CHAT ===\n\n"
+        )
+
     def _conversation_digest(self, *, limit: int = 20, cap: int = 2000) -> List[Dict[str, str]]:
-        """Recent conversation turns, size-bounded for prompt inclusion."""
+        """Recent conversation turns, size-bounded for prompt inclusion.
+
+        In a group chat each turn is prefixed with who it was From and who it was
+        directed To (and flagged when it was directed at this agent), so the
+        model can follow the multi-party thread rather than assuming every turn
+        was addressed to it."""
         digest: List[Dict[str, str]] = []
         for m in self._conversation[-limit:]:
-            text = m.get("content", "")
-            digest.append({"role": m.get("role", "user"), "content": text[:cap]})
+            text = str(m.get("content", ""))[:cap]
+            if self._group_chat:
+                prefix = self._turn_prefix(m)
+                if prefix:
+                    text = f"{prefix} {text}"
+            digest.append({"role": m.get("role", "user"), "content": text})
         return digest
+
+    def _turn_prefix(self, m: Dict[str, Any]) -> str:
+        """Build a "[From → To]" annotation for a group-chat turn."""
+        sender = str(m.get("from") or "").strip()
+        to = m.get("to") if isinstance(m.get("to"), list) else []
+        targets = []
+        for t in to:
+            if isinstance(t, dict) and str(t.get("name") or "").strip():
+                targets.append(str(t["name"]).strip())
+        parts = ""
+        if sender:
+            parts = f"[{sender}"
+            if targets:
+                parts += " → " + ", ".join(targets)
+            else:
+                parts += " → everyone"
+            parts += "]"
+        if m.get("directedToMe"):
+            parts = (parts + " (directed at you)") if parts else "(directed at you)"
+        return parts
 
     # -- pass-through identity (used by the runtime for capability reporting) --
     @property

@@ -159,3 +159,69 @@ def test_reasoner_set_conversation_ignores_blank():
     reasoner = LLMReasoner(client)
     reasoner.set_conversation([{"role": "user", "content": "  "}, {"role": "user", "content": "keep"}])
     assert reasoner._conversation == [{"role": "user", "content": "keep"}]
+
+
+# --------------------------------------------------------------------------- #
+# group-chat awareness (decoupled multi-agent tagging)
+# --------------------------------------------------------------------------- #
+
+def test_normalize_history_preserves_group_annotations():
+    convo = _normalize_history([
+        {"role": "user", "content": "draft it", "from": "shayan",
+         "to": [{"name": "Bob", "kind": "agent"}], "directedToMe": True},
+        {"role": "user", "content": "no annotations here"},
+    ])
+    assert convo[0]["from"] == "shayan"
+    assert convo[0]["to"] == [{"name": "Bob", "kind": "agent"}]
+    assert convo[0]["directedToMe"] is True
+    # A plain turn carries none of the optional group keys.
+    assert "to" not in convo[1] and "directedToMe" not in convo[1]
+
+
+def test_group_preamble_lists_peers_and_excludes_self():
+    client = _CapturingClient("{}")
+    reasoner = LLMReasoner(client)
+    reasoner.set_group_context(
+        self_identity={"id": "res_tina", "name": "Tina", "handle": "tina"},
+        roster=[
+            {"id": "res_tina", "name": "Tina", "handle": "tina", "kind": "agent"},
+            {"id": "res_bob", "name": "Bob", "handle": "bob", "kind": "agent"},
+            {"id": "u_1", "name": "shayan", "handle": "shayan", "kind": "user"},
+        ],
+        group_chat=True,
+    )
+    preamble = reasoner._group_preamble()
+    assert 'You are "Tina"' in preamble
+    assert "@bob" in preamble and "@shayan" in preamble
+    # Never lists itself among the "other participants".
+    assert preamble.count("Tina") == 1
+    # The @mention protocol (trigger + no-ack-loop) is spelled out.
+    assert "@mention" in preamble.lower()
+    # It is woven into the system prompt.
+    assert preamble in reasoner._system("BASE")
+
+
+def test_group_preamble_empty_off_group():
+    client = _CapturingClient("{}")
+    reasoner = LLMReasoner(client)
+    assert reasoner._group_preamble() == ""
+    assert reasoner._system("BASE") == "BASE"
+
+
+def test_conversation_digest_annotates_turns_in_group_chat():
+    client = _CapturingClient("{}")
+    reasoner = LLMReasoner(client)
+    reasoner.set_group_context(
+        self_identity={"id": "res_tina", "name": "Tina"},
+        roster=[{"id": "res_bob", "name": "Bob", "handle": "bob", "kind": "agent"}],
+        group_chat=True,
+    )
+    reasoner.set_conversation([
+        {"role": "user", "content": "hi all", "from": "shayan"},
+        {"role": "user", "content": "review it", "from": "shayan",
+         "to": [{"name": "Tina", "kind": "agent"}], "directedToMe": True},
+    ])
+    digest = reasoner._conversation_digest()
+    assert digest[0]["content"].startswith("[shayan → everyone]")
+    assert "→ Tina]" in digest[1]["content"]
+    assert "(directed at you)" in digest[1]["content"]

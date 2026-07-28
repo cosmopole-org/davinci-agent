@@ -493,6 +493,25 @@ def _run_agent(bridge: Any, task: Dict[str, Any], config: Dict[str, Any],
     except Exception as exc:  # noqa: BLE001 — never block boot on LLM wiring
         print("DAVINCI_BOOT " + json.dumps({"llm_init_error": repr(exc)[:160]}), flush=True)
 
+    # Group-chat awareness (shared-space runs): tell the reasoner who this agent
+    # is, who else is in the space, and that it is one participant in a decoupled
+    # multi-party thread. The orchestrator sends ``self`` (this agent's identity),
+    # ``roster`` (the other agents + people) and ``groupChat`` with the task.
+    group_setter = getattr(reasoner, "set_group_context", None) if reasoner is not None else None
+    if callable(group_setter):
+        try:
+            group_setter(
+                self_identity=task.get("self") if isinstance(task.get("self"), dict) else None,
+                roster=task.get("roster") if isinstance(task.get("roster"), list) else None,
+                group_chat=bool(task.get("groupChat") or task.get("group_chat")),
+            )
+            if task.get("roster") or task.get("groupChat"):
+                print("DAVINCI_GROUP " + json.dumps(
+                    {"self": task.get("self"),
+                     "participants": len(task.get("roster") or [])}), flush=True)
+        except Exception as exc:  # noqa: BLE001 — never block a run on group wiring
+            print("DAVINCI_BOOT " + json.dumps({"group_ctx_error": repr(exc)[:160]}), flush=True)
+
     snapshot = _capability_snapshot(registry)
     snapshot["live_signaling"] = live
     snapshot["discovery"] = discovery

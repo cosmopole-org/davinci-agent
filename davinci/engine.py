@@ -70,6 +70,25 @@ def _normalize_history(history: Optional[List[Dict[str, Any]]]) -> List[Dict[str
         name = item.get("agentName") or item.get("agent") or item.get("name")
         if isinstance(name, str) and name.strip():
             entry["agentName"] = name.strip()
+        # Group-chat annotations: who the turn was from, who it was directed at,
+        # and whether this agent was one of its targets. Preserved so the
+        # reasoner can render "who is talking to whom" for the model.
+        sender = item.get("from")
+        if isinstance(sender, str) and sender.strip():
+            entry["from"] = sender.strip()
+        to = item.get("to")
+        if isinstance(to, list):
+            targets = []
+            for t in to:
+                if isinstance(t, dict):
+                    tname = str(t.get("name") or "").strip()
+                    if tname:
+                        targets.append({"name": tname,
+                                        "kind": "user" if t.get("kind") == "user" else "agent"})
+            if targets:
+                entry["to"] = targets
+        if item.get("directedToMe"):
+            entry["directedToMe"] = True
         out.append(entry)
     return out
 

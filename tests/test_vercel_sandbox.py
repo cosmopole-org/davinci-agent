@@ -408,6 +408,27 @@ def test_deploy_bakes_every_token_spelling_the_tool_accepts():
         f"not baked: {sorted(read_by_tool - set(deploy_and_test.SANDBOX_ENV_KEYS))}")
 
 
+def test_build_context_digest_is_stable_and_covers_the_whole_context():
+    """The digest is what tells a redeploy "already built" from "still
+    building". If it missed part of the context a stale image would be taken
+    for current; if it were unstable every redeploy would wait out the timeout
+    it exists to avoid."""
+    sys.path.insert(0, str(_REPO / "scripts"))
+    import deploy_and_test as dt  # noqa: PLC0415
+
+    df, files = b"FROM python:3.12-slim\n", {"tool.py": "YWJj", "req.txt": "eHl6"}
+    stamped, digest = dt.stamp_context(df, files)
+
+    assert dt.stamp_context(df, files)[1] == digest                      # stable
+    assert dt.stamp_context(df, {**files, "tool.py": "ZGVm"})[1] != digest  # file content
+    assert dt.stamp_context(df, {**files, "new.py": "YWJj"})[1] != digest   # new file
+    assert dt.stamp_context(df + b"ENV X=1\n", files)[1] != digest          # dockerfile
+    # The digest rides in the image config, so a changed context can never
+    # produce the same image id — which is what makes waiting on it terminate.
+    assert stamped.decode().strip().endswith(f'LABEL {dt.CONTEXT_LABEL}="{digest}"')
+    assert digest not in df.decode()  # derived from the context *without* the label
+
+
 def test_unknown_function_lists_the_supported_ones():
     mod, _ = _load(_ok_handler())
     out = mod.invoke("teleport", {"space_id": SPACE})

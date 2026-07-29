@@ -239,11 +239,12 @@ TOOLS = _discover_tools()
 BUILD_TIMEOUT = {"browser_automation": 900, "sql_query": 480, "vector_search": 480,
                  "calendar_connector": 480}
 
-GREEN, RED, CYAN, NC = "\033[0;32m", "\033[0;31m", "\033[0;36m", "\033[0m"
+GREEN, RED, YELLOW, CYAN, NC = "\033[0;32m", "\033[0;31m", "\033[0;33m", "\033[0;36m", "\033[0m"
 
 
 def info(m): print(f"{CYAN}[deploy]{NC} {m}", flush=True)
 def ok(m):   print(f"{GREEN}[ ok ]{NC} {m}", flush=True)
+def warn(m): print(f"{YELLOW}[warn]{NC} {m}", flush=True)
 def bad(m):  print(f"{RED}[fail]{NC} {m}", flush=True)
 
 

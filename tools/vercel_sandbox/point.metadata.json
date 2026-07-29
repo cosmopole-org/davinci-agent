@@ -1,0 +1,96 @@
+{
+  "isMcp": true,
+  "tool_id": "vercel_sandbox",
+  "vm_name": "vercel-sandbox-vm",
+  "machine_id": "vercel-sandbox-machine",
+  "image_name": "vercel-sandbox:latest",
+  "container_name": "tool-vercel-sandbox",
+  "description": "Per-space cloud sandbox (Vercel Sandbox microVM) bound to a Decillion space: run shell commands, install packages, write and read files, expose ports",
+  "prompt": "Use this to actually DO work on a machine instead of only describing it: run shell commands, install dependencies, clone repos, execute build/test suites, write and read files, and expose a port so the humans in the space can open what you built. Every space has exactly one sandbox and it is shared by the whole team, so files you write persist between turns and other agents in the space see them. The sandbox is addressed by the space it belongs to — you never create or choose one. Name the operation with `function`: exec (default), write, read, mkdir, info, start, stop.",
+  "request_point": "tool::vercel_sandbox::request",
+  "response_point": "tool::vercel_sandbox::response",
+  "risk_level": "high",
+  "requires_network": true,
+  "categories": [
+    "execution"
+  ],
+  "routes": {
+    "execution": "exec"
+  },
+  "tools": [
+    {
+      "name": "exec",
+      "desc": "run a shell command in the space's sandbox and return stdout, stderr and the exit code; the whole line is run through `sh -c`, so pipes, redirects and && work",
+      "args": {
+        "function": {"type": "STRING", "desc": "the operation to run: exec | write | read | mkdir | info | start | stop (default exec)"},
+        "command": {"type": "STRING", "desc": "the shell command line to run, e.g. 'npm install && npm test'"},
+        "cwd": {"type": "STRING", "desc": "optional working directory (defaults to the sandbox home directory)"},
+        "env": {"type": "OBJECT", "desc": "optional extra environment variables for this command"},
+        "timeout_ms": {"type": "NUMBER", "desc": "optional per-command timeout in milliseconds (default 300000)"},
+        "path": {"type": "STRING", "desc": "for write/read/mkdir: the file or directory path"},
+        "content": {"type": "STRING", "desc": "for write: the file content"}
+      }
+    },
+    {
+      "name": "write",
+      "desc": "create or overwrite a file in the space's sandbox",
+      "args": {
+        "path": {"type": "STRING", "desc": "file path, absolute or relative to the home directory"},
+        "content": {"type": "STRING", "desc": "file content"},
+        "encoding": {"type": "STRING", "desc": "'text' (default) or 'base64' for binary content"},
+        "cwd": {"type": "STRING", "desc": "optional base directory for relative paths"}
+      }
+    },
+    {
+      "name": "read",
+      "desc": "read a file back out of the space's sandbox",
+      "args": {
+        "path": {"type": "STRING", "desc": "file path to read"},
+        "cwd": {"type": "STRING", "desc": "optional base directory for relative paths"}
+      }
+    },
+    {
+      "name": "mkdir",
+      "desc": "create a directory in the space's sandbox",
+      "args": {
+        "path": {"type": "STRING", "desc": "directory path to create"}
+      }
+    },
+    {
+      "name": "info",
+      "desc": "report the space's sandbox status, runtime, working directory and the public URLs of any exposed ports",
+      "args": {
+        "resume": {"type": "BOOL", "desc": "resume the sandbox if it is stopped (default false)"}
+      }
+    },
+    {
+      "name": "start",
+      "desc": "boot or resume the space's sandbox from its snapshot before a burst of work",
+      "args": {
+        "ports": {"type": "ARRAY", "desc": "optional ports to expose publicly when it has to be created"}
+      }
+    },
+    {
+      "name": "stop",
+      "desc": "stop the space's sandbox VM, keeping its filesystem — the next command resumes it",
+      "args": {}
+    },
+    {
+      "name": "create",
+      "desc": "provision the sandbox bound to a space (called by the platform when a space is created; agents should use start instead)",
+      "args": {
+        "space_id": {"type": "STRING", "desc": "the Decillion space id the sandbox is bound to"},
+        "runtime": {"type": "STRING", "desc": "node22 | node24 | node26 | python3.13 (default node24)"},
+        "ports": {"type": "ARRAY", "desc": "ports to expose publicly"},
+        "timeout_ms": {"type": "NUMBER", "desc": "maximum session lifetime in milliseconds"}
+      }
+    },
+    {
+      "name": "delete",
+      "desc": "destroy the sandbox bound to a space and all of its snapshots (called by the platform when a space is deleted)",
+      "args": {
+        "space_id": {"type": "STRING", "desc": "the Decillion space id whose sandbox is being destroyed"}
+      }
+    }
+  ]
+}

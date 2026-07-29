@@ -245,10 +245,17 @@ class BridgeCreatureExecutor:
         spec = self.tools.get(tool.name)
         if not spec:
             return ToolResult(ok=False, output=None, error=f"unknown tool creature {tool.name}")
-        target = spec.get("program_id") or spec.get("machine_id") or ""
+        target = (spec.get("program_id") or spec.get("machine_id")
+                  or spec.get("creature_id") or "")
         if not target:
             return ToolResult(ok=False, output=None, error=f"no target machine for tool {tool.name}")
         payload = {k: v for k, v in (action.args or {}).items() if v is not None}
+        # Catalog-pinned arguments (e.g. the space a per-space tool creature is
+        # bound to) are applied AFTER the model's, so the reasoner can neither
+        # forget them nor point the tool at another space's resources.
+        defaults = spec.get("defaults")
+        if isinstance(defaults, dict):
+            payload.update({k: v for k, v in defaults.items() if v is not None})
         correlation_id = uuid.uuid4().hex
         # ``entityId`` is REQUIRED for the node to cold-spawn the right tool
         # creature: when no live tool connection exists the node's machine
@@ -257,14 +264,18 @@ class BridgeCreatureExecutor:
         # to the program default and the tool image is never located, so the
         # invoke silently never runs and the caller times out. The node parses it
         # off the signal envelope (``stores::Send.entityId``).
-        entity_id = spec.get("entity_id") or spec.get("tool_id", tool.name)
+        entity_id = spec.get("entity_id") or spec.get("entityId") or spec.get("tool_id", tool.name)
+        # A multi-function tool creature (the per-space sandbox: exec/write/read/…)
+        # is one catalog entry, so the function comes from the model's arguments
+        # when it named one; the catalog's routing function is the default.
+        function = payload.get("function") or spec.get("function") or "invoke"
         packet = {
             "kind": "invoke",
             "entityId": entity_id,
             "correlationId": correlation_id,
             "reply_to": self.my_id,
             "tool_id": spec.get("tool_id", tool.name),
-            "function": spec.get("function", "invoke"),
+            "function": str(function),
             "payload": payload,
         }
         ev = threading.Event()
@@ -347,8 +358,14 @@ def _registry_from_tool_catalog(tools: List[Dict[str, Any]]) -> ToolRegistry:
         # reasoner emits the tool's real argument names (e.g. python_exec's
         # ``code``) instead of the generic ``task`` fallback.
         arg_schema = t.get("arg_schema") or {}
+        # A multi-function tool's arguments are mostly optional (the sandbox's
+        # `path` only applies to write/read), so the catalog may name the truly
+        # required ones; without that hint every declared arg stays required.
+        required = t.get("required")
+        if not isinstance(required, list):
+            required = list(arg_schema.keys())
         schema = {"type": "object", "properties": arg_schema,
-                  "required": list(arg_schema.keys())} if arg_schema else None
+                  "required": [r for r in required if r in arg_schema]} if arg_schema else None
         reg.register(ToolDescriptor(
             name=t.get("name") or f"caspar__{t['tool_id']}",
             description=t.get("description", t["tool_id"]),

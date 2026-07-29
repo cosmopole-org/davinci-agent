@@ -485,7 +485,13 @@ def _run_agent(bridge: Any, task: Dict[str, Any], config: Dict[str, Any],
         # creatures purely by signalling their live VMs over the gateway.
         my_id = bridge.machine_id or bridge.program_id or ""
         tools_by_name = {t.get("name") or f"caspar__{t['tool_id']}": t for t in tools}
-        registry = _registry_from_tool_catalog(tools) if tools else _build_registry()
+        # The catalog the orchestrator sent is the WHOLE truth about what this
+        # agent can do — never fall back to the built-in demo capabilities here.
+        # Those are placeholders with no creature behind them, so an agent handed
+        # them will tell users it can search the web and run Python, then fail or
+        # hallucinate when asked to. An empty catalog means precisely one thing:
+        # this agent has no tools, and it should say so.
+        registry = _registry_from_tool_catalog(tools)
         executor = BridgeCreatureExecutor(bridge, tools_by_name, my_id)
         discovery = "bridge"
         live = True
@@ -533,6 +539,10 @@ def _run_agent(bridge: Any, task: Dict[str, Any], config: Dict[str, Any],
     snapshot["live_signaling"] = live
     snapshot["discovery"] = discovery
     snapshot["llm_provider"] = llm_provider
+    # Name the tools this run actually got. "The agent says it cannot do X" is
+    # otherwise indistinguishable from "the orchestrator sent an empty catalog",
+    # and the logs are the only place to tell them apart.
+    snapshot["tools"] = sorted(tools_by_name)
     task_summary = {k: v for k, v in task.items() if k not in ("attachments", "config")}
     if task.get("attachments"):
         task_summary["attachments"] = [

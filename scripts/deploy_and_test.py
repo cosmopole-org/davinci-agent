@@ -131,6 +131,22 @@ def llm_bake_env() -> dict:
                 env[model_env] = models.split(",")[0].strip()
     return env
 
+# The per-space sandbox creature talks to the Vercel Sandbox REST API. Its token
+# is baked into the tool image (never sent in a signal payload), read from this
+# harness's environment only — never written to the repo or committed.
+SANDBOX_ENV_KEYS = (
+    "VERCEL_TOKEN", "VERCEL_TEAM_ID", "VERCEL_PROJECT_ID", "VERCEL_API_BASE",
+    "VERCEL_SANDBOX_RUNTIME", "VERCEL_SANDBOX_TIMEOUT_MS", "VERCEL_SANDBOX_VCPUS",
+    "VERCEL_SANDBOX_PREFIX", "VERCEL_SANDBOX_MAX_OUTPUT", "VERCEL_SANDBOX_EXEC_TIMEOUT_MS",
+)
+
+
+def sandbox_bake_env() -> dict:
+    """Vercel credentials + tuning to bake into the vercel_sandbox tool image."""
+    return {k: os.environ[k].strip() for k in SANDBOX_ENV_KEYS
+            if os.environ.get(k, "").strip()}
+
+
 # In hardened environments outbound HTTPS is intercepted by an egress gateway
 # whose CA must be trusted inside the creature containers (otherwise Gemini /
 # web tools fail TLS verification). We ship the host CA bundle into each image.
@@ -358,11 +374,25 @@ def davinci_bundle_tar() -> bytes:
 # Phases
 # --------------------------------------------------------------------------- #
 
-def deploy_tool(c: CasparSignalingClient, tool: dict) -> dict:
+def deploy_tool(c: CasparSignalingClient, tool: dict, *, program_id: Optional[str] = None,
+                machine_id: str = "", bake_env: Optional[dict] = None) -> dict:
+    """Deploy (or re-deploy) one tool as its own docker creature.
+
+    Passing ``program_id`` redeploys a FRESH entity onto an existing program
+    instead of minting a new creature — the same reuse path ``deploy_davinci``
+    takes, so a tool that Nest already references by id (the per-space sandbox)
+    keeps that id across redeploys and no space is left pointing at a dead
+    program.
+    """
     tid = tool["tool_id"]
     tool_dir = REPO / "tools" / tid
-    machine_id = c.create_machine_creature(f"m-tool-{tid}-{RUN_TAG}")
-    program_id = c.create_program(machine_id, f"/tools/{tid}", "docker", f"tool {tid}")
+    prev_image_id = None
+    if program_id:
+        info(f"redeploying tool {tid} onto existing program {program_id} — no new creature")
+        prev_image_id = docker_image_id(program_id, tid)
+    else:
+        machine_id = c.create_machine_creature(f"m-tool-{tid}-{RUN_TAG}")
+        program_id = c.create_program(machine_id, f"/tools/{tid}", "docker", f"tool {tid}")
 
     # Build context: the shared runtime + the tool's real implementation, plus
     # its requirements.txt so the tool's own Dockerfile can install its deps.
@@ -422,8 +452,13 @@ def deploy_tool(c: CasparSignalingClient, tool: dict) -> dict:
             f"\nENV HTTPS_PROXY={tool_proxy} HTTP_PROXY={tool_proxy} "
             f"https_proxy={tool_proxy} http_proxy={tool_proxy}\n").encode()
 
+    # Per-tool credentials (e.g. the vercel_sandbox API token) are baked into the
+    # image so they never travel in a signal payload an agent could influence.
+    dockerfile = dockerfile + _bake_env_snippet(bake_env or {}).encode()
+
     c.deploy(program_id, tid, "docker", b64_bytes(dockerfile), files_b64=files)
-    if not wait_for_image(program_id, tid, timeout=BUILD_TIMEOUT.get(tid, 300)):
+    if not wait_for_image(program_id, tid, timeout=BUILD_TIMEOUT.get(tid, 300),
+                          prev_image_id=prev_image_id):
         raise RuntimeError(f"image for tool {tid} not built in time")
     rec = dict(tool); rec.update({"machine_id": machine_id, "program_id": program_id,
                                   "entity_id": tid, "name": f"caspar__{tid}"})
@@ -573,7 +608,8 @@ def main() -> int:
     info("── Phase 1: deploy tool creatures ──")
     tool_recs = []
     for tool in TOOLS:
-        rec = deploy_tool(c, tool)
+        rec = deploy_tool(c, tool,
+                          bake_env=sandbox_bake_env() if tool["tool_id"] == "vercel_sandbox" else None)
         tool_recs.append(rec)
         results["tools_deployed"] += 1
 

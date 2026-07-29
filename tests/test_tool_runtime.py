@@ -34,6 +34,30 @@ def test_unknown_tool_falls_back_to_echo():
     assert out["ok"] is True and out["echo"] == {"x": 1}
 
 
+def test_extract_invoke_takes_a_creature_to_creature_packet_as_is():
+    packet = {"kind": "invoke", "tool_id": "web_search", "function": "search",
+              "payload": {"query": "caspar"}, "correlationId": "c1"}
+    assert tool_runtime._extract_invoke(packet) == packet
+
+
+def test_extract_invoke_peels_the_backend_signal_envelope():
+    """A `/creatures/signal` from Nest arrives double-wrapped: the node's
+    StoresSend carries a JSON string that itself carries the invoke packet as
+    another JSON string, alongside the correlation id the caller awaits."""
+    invoke = {"tool_id": "vercel_sandbox", "function": "exec",
+              "payload": {"space_id": "42@global", "command": "ls"},
+              "reply_to": "9@global", "correlationId": "c7"}
+    envelope = {"action": "signal", "entityId": "vercel_sandbox",
+                "data": json.dumps({"programId": "3@global", "entity": "vercel_sandbox",
+                                    "payload": json.dumps(invoke)})}
+
+    packet = tool_runtime._extract_invoke(envelope)
+
+    assert packet["tool_id"] == "vercel_sandbox" and packet["function"] == "exec"
+    assert packet["payload"] == {"space_id": "42@global", "command": "ls"}
+    assert packet["correlationId"] == "c7" and packet["reply_to"] == "9@global"
+
+
 def test_tool_runtime_main_emits_response(tmp_path):
     input_dir = tmp_path / "input"
     input_dir.mkdir()

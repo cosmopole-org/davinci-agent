@@ -215,9 +215,19 @@ tool's real dependencies and the shared runtime.
 | `slack_connector` | `slack_action` | Slack Web API (post/history/upload/…) | `SLACK_BOT_TOKEN` |
 | `jira_connector` | `jira_action` | Jira Cloud REST v3 (issues/JQL/transitions) | `JIRA_URL`/`JIRA_EMAIL`/`JIRA_API_TOKEN` |
 | `calendar_connector` | `calendar_action` | Google Calendar / CalDAV / `.ics` generation | Google SA / CalDAV creds (ICS works offline) |
+| `vercel_sandbox` | `exec`, `write`, `read`, `info`, `stop` | the **per-space cloud sandbox**: one persistent Vercel Sandbox microVM per Decillion space — run commands, install deps, write/read files, expose ports | `VERCEL_TOKEN`, `VERCEL_TEAM_ID`, `VERCEL_PROJECT_ID` |
 
 Connectors that need credentials return a clear `{ok: false, error}` when they
 are absent — the call path itself is fully real.
+
+`vercel_sandbox` is the one tool with a **platform lifecycle**: Decillion signals
+it to create a sandbox when a space is created and to destroy it when the space
+is deleted, and publishes it into the space so every agent there — including
+agents added later — discovers it as a tool and drives it over the same Caspar
+signalling path as any other creature. Deploy it on its own with
+`scripts/deploy_sandbox_tool.py` (which bakes the Vercel credentials into the
+image and prints the ids Nest records). See
+[`tools/vercel_sandbox/README.md`](tools/vercel_sandbox/README.md).
 
 ## Repository layout
 

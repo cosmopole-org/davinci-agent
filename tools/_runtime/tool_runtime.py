@@ -240,18 +240,35 @@ def _extract_invoke(data: dict) -> dict:
     * **external client → creature** — a ``/creatures/signal`` (pvp) is wrapped by
       the node as ``StoresSend{action, user, data:"<json>", entityId}``; the real
       packet is the JSON string in ``data["data"]``.
+
+    The external shape carries **one more layer**: a client (the Decillion
+    backend) sends ``{programId, entity, payload:"<json>"}`` and the invoke
+    packet — plus the correlation id the caller is waiting on — is that inner
+    JSON string. This is the same double peel the wasm creatures do in
+    ``unwrapSignal``, and without it the tool would be handed a *string* where
+    it expects its arguments.
     """
     if not isinstance(data, dict):
         return {}
-    if data.get("kind") == "invoke" or "tool_id" in data or "function" in data:
-        return data
-    inner = data.get("data")
-    if isinstance(inner, str):
+    packet = data
+    if not (data.get("kind") == "invoke" or "tool_id" in data or "function" in data):
+        inner = data.get("data")
+        if isinstance(inner, str):
+            try:
+                inner = json.loads(inner)
+            except Exception:  # noqa: BLE001
+                return {}
+        packet = inner if isinstance(inner, dict) else {}
+    nested = packet.get("payload")
+    if isinstance(nested, str):
         try:
-            inner = json.loads(inner)
+            nested = json.loads(nested)
         except Exception:  # noqa: BLE001
-            return {}
-    return inner if isinstance(inner, dict) else {}
+            nested = None
+        if isinstance(nested, dict):
+            outer = {k: v for k, v in packet.items() if k != "payload"}
+            packet = {**outer, **nested}
+    return packet
 
 
 def _handle_invoke(bridge, packet: dict) -> None:

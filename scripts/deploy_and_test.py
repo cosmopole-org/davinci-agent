@@ -23,6 +23,7 @@ Run:  python3 scripts/deploy_and_test.py
 from __future__ import annotations
 
 import base64
+import hashlib
 import io
 import json
 import os
@@ -289,6 +290,47 @@ def docker_image_exists(program_id: str, entity_id: str) -> bool:
         return False
 
 
+# Label stamped into every creature image, carrying a digest of the exact build
+# context it was built from. It is what lets a redeploy tell "the node already
+# built this" from "the node has not finished building yet" — see
+# `wait_for_image`, where guessing between those two used to cost a full timeout.
+CONTEXT_LABEL = "org.decillion.build-context"
+
+
+def context_digest(dockerfile: bytes, files_b64: dict) -> str:
+    """sha256 over the whole build context (Dockerfile + every shipped file)."""
+    h = hashlib.sha256()
+    h.update(dockerfile)
+    for name in sorted(files_b64 or {}):
+        h.update(name.encode())
+        h.update(files_b64[name].encode())
+    return h.hexdigest()
+
+
+def stamp_context(dockerfile: bytes, files_b64: dict) -> tuple:
+    """Append the context LABEL to a Dockerfile. Returns (dockerfile, digest).
+
+    The label is derived from the context *without* it, so it is stable, and
+    because it lands in the image config a changed context always produces a
+    different image id — which is what makes waiting on the id meaningful.
+    """
+    digest = context_digest(dockerfile, files_b64)
+    return dockerfile + f'\nLABEL {CONTEXT_LABEL}="{digest}"\n'.encode(), digest
+
+
+def docker_image_context(program_id: str, entity_id: str) -> str:
+    """The context digest baked into the current image, or "" when absent."""
+    image = f"{program_id.replace('@', '_')}/{entity_id}"
+    try:
+        out = subprocess.run(
+            ["docker", "inspect", "--format",
+             '{{index .Config.Labels "' + CONTEXT_LABEL + '"}}', image],
+            capture_output=True, text=True, timeout=15)
+        return out.stdout.strip() if out.returncode == 0 else ""
+    except Exception:
+        return ""
+
+
 def docker_image_id(program_id: str, entity_id: str) -> str:
     """Current image ID for a program/entity tag, or "" when it doesn't exist.
 
@@ -307,29 +349,44 @@ def docker_image_id(program_id: str, entity_id: str) -> str:
 
 
 def wait_for_image(program_id: str, entity_id: str, timeout: int = 240,
-                   prev_image_id: Optional[str] = None) -> bool:
+                   prev_image_id: Optional[str] = None,
+                   expect_context: Optional[str] = None) -> bool:
     """Wait until the node has (re)built the entity's docker image.
 
     The node builds asynchronously and only re-tags on success, so on a REDEPLOY
     the old tag is present the whole time — a plain existence check returns
     instantly and runEntity would recreate the container from the PRE-rebuild
-    image. When ``prev_image_id`` is provided (the id captured just before the
-    redeploy), wait for the id to actually CHANGE, so the container is recreated
-    from the new build. If it never changes within the timeout, the rebuild was a
-    cached no-op (identical code) — the tag is already current, so proceed.
+    image. So we wait for the image to actually change.
+
+    ``expect_context`` is the digest of the context we just deployed (see
+    :func:`stamp_context`) and is what makes that wait *terminate*. Without it
+    the only signal is the image id, and a fully-cached rebuild — identical
+    code, so docker re-tags the same id — is indistinguishable from a build
+    still in progress: the loop then burned the entire timeout (6 minutes for
+    davinci) on every no-op redeploy before shrugging and proceeding. Since the
+    digest is a LABEL, a changed context always yields a different image, so
+    "the image already carries this digest" means the build is genuinely done.
     """
     image = f"{program_id.replace('@', '_')}/{entity_id}"
     deadline = time.time() + timeout
-    if prev_image_id:
-        info(f"waiting for node to REBUILD image {image} (was {prev_image_id[:19]}, ≤{timeout}s)…")
+    if prev_image_id or expect_context:
+        info(f"waiting for node to REBUILD image {image} (≤{timeout}s)…")
         while time.time() < deadline:
+            if expect_context and docker_image_context(program_id, entity_id) == expect_context:
+                ok(f"image built from the deployed context: {image}")
+                return True
             cur = docker_image_id(program_id, entity_id)
-            if cur and cur != prev_image_id:
+            if prev_image_id and cur and cur != prev_image_id:
                 ok(f"image rebuilt: {image} -> {cur[:19]}")
                 return True
             time.sleep(3)
-        warn(f"image id unchanged after {timeout}s — treating as a cached/no-op rebuild "
-             f"(identical code); proceeding with the current image")
+        # Reaching here with a context digest means the node never produced an
+        # image carrying it — a real build failure, not a cached no-op. It is
+        # still only a warning because a host where `docker` is not queryable
+        # (the deployer does not always share the node's docker socket) reports
+        # empty for everything, and that must not fail an otherwise fine deploy.
+        warn(f"image {image} did not change after {timeout}s — proceeding with the "
+             f"current image; check the node's build logs if the entity misbehaves")
         return True
     info(f"waiting for node to build image {image} (≤{timeout}s)…")
     while time.time() < deadline:
@@ -462,11 +519,18 @@ def deploy_tool(c: CasparSignalingClient, tool: dict, *, program_id: Optional[st
     # Per-tool credentials (e.g. the vercel_sandbox API token) are baked into the
     # image so they never travel in a signal payload an agent could influence.
     dockerfile = dockerfile + _bake_env_snippet(bake_env or {}).encode()
+    dockerfile, digest = stamp_context(dockerfile, files)
 
-    c.deploy(program_id, tid, "docker", b64_bytes(dockerfile), files_b64=files)
-    if not wait_for_image(program_id, tid, timeout=BUILD_TIMEOUT.get(tid, 300),
-                          prev_image_id=prev_image_id):
-        raise RuntimeError(f"image for tool {tid} not built in time")
+    # An image already built from this exact context needs no rebuild and no
+    # wait — the deploy below only (re)registers the entity with the node.
+    if prev_image_id and docker_image_context(program_id, tid) == digest:
+        c.deploy(program_id, tid, "docker", b64_bytes(dockerfile), files_b64=files)
+        ok(f"tool creature {tid} already built from this context: program={program_id}")
+    else:
+        c.deploy(program_id, tid, "docker", b64_bytes(dockerfile), files_b64=files)
+        if not wait_for_image(program_id, tid, timeout=BUILD_TIMEOUT.get(tid, 300),
+                              prev_image_id=prev_image_id, expect_context=digest):
+            raise RuntimeError(f"image for tool {tid} not built in time")
     rec = dict(tool); rec.update({"machine_id": machine_id, "program_id": program_id,
                                   "entity_id": tid, "name": f"caspar__{tid}"})
     ok(f"tool creature deployed: {tid}  program={program_id}")
@@ -549,11 +613,19 @@ def deploy_davinci(c: CasparSignalingClient, bake_env: dict = None,
         files["ca-certificates.crt"] = b64_bytes(ca)
         dockerfile = dockerfile + CA_DOCKERFILE_SNIPPET
     dockerfile = dockerfile + _bake_env_snippet(bake_env or {})
-    c.deploy(program_id, entity_id, "docker", b64_bytes(dockerfile.encode()), files_b64=files)
-    _rebuild_timeout = int(os.environ.get("DAVINCI_REBUILD_TIMEOUT", "360"))
-    if not wait_for_image(program_id, entity_id, timeout=_rebuild_timeout,
-                          prev_image_id=prev_image_id):
-        raise RuntimeError("davinci image not built in time")
+    stamped, digest = stamp_context(dockerfile.encode(), files)
+    already_current = bool(prev_image_id) and docker_image_context(program_id, entity_id) == digest
+    c.deploy(program_id, entity_id, "docker", b64_bytes(stamped), files_b64=files)
+    if already_current:
+        # Same code as the running image: the node's rebuild is a cached no-op,
+        # so there is nothing to wait for. This is the case that used to burn the
+        # whole DAVINCI_REBUILD_TIMEOUT on every redeploy of unchanged davinci.
+        ok(f"davinci image already built from this context — no rebuild to wait for")
+    else:
+        _rebuild_timeout = int(os.environ.get("DAVINCI_REBUILD_TIMEOUT", "360"))
+        if not wait_for_image(program_id, entity_id, timeout=_rebuild_timeout,
+                              prev_image_id=prev_image_id, expect_context=digest):
+            raise RuntimeError("davinci image not built in time")
     ok(f"davinci creature deployed: program={program_id} entity={entity_id}")
     return {"machine_id": machine_id, "program_id": program_id, "entity_id": entity_id}
 

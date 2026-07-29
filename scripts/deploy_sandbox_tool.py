@@ -68,7 +68,7 @@ def main() -> int:
     dt.ok(f"logged in as {dt.ADMIN_USER} (user_id={c.user_id})")
 
     bake = dt.sandbox_bake_env()
-    if bake.get("VERCEL_TOKEN"):
+    if any(bake.get(k) for k in ("VERCEL_TOKEN", "VERCEL_API_TOKEN", "VERCEL_ACCESS_TOKEN")):
         scope = bake.get("VERCEL_TEAM_ID") or "personal account"
         dt.info(f"baking Vercel credentials into the sandbox creature image (scope={scope})")
     else:

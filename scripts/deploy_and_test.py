@@ -134,10 +134,17 @@ def llm_bake_env() -> dict:
 # The per-space sandbox creature talks to the Vercel Sandbox REST API. Its token
 # is baked into the tool image (never sent in a signal payload), read from this
 # harness's environment only — never written to the repo or committed.
+# Every name tools/vercel_sandbox/tool.py reads. All three token spellings are
+# here on purpose: the tool accepts any of them, so baking only VERCEL_TOKEN
+# would let an operator who set VERCEL_API_TOKEN deploy a creature that looks
+# healthy and then refuses every call for want of credentials.
 SANDBOX_ENV_KEYS = (
-    "VERCEL_TOKEN", "VERCEL_TEAM_ID", "VERCEL_PROJECT_ID", "VERCEL_API_BASE",
+    "VERCEL_TOKEN", "VERCEL_API_TOKEN", "VERCEL_ACCESS_TOKEN",
+    "VERCEL_TEAM_ID", "VERCEL_PROJECT_ID", "VERCEL_API_BASE",
     "VERCEL_SANDBOX_RUNTIME", "VERCEL_SANDBOX_TIMEOUT_MS", "VERCEL_SANDBOX_VCPUS",
-    "VERCEL_SANDBOX_PREFIX", "VERCEL_SANDBOX_MAX_OUTPUT", "VERCEL_SANDBOX_EXEC_TIMEOUT_MS",
+    "VERCEL_SANDBOX_PREFIX", "VERCEL_SANDBOX_MAX_OUTPUT", "VERCEL_SANDBOX_MAX_READ_BYTES",
+    "VERCEL_SANDBOX_EXEC_TIMEOUT_MS", "VERCEL_SANDBOX_HTTP_TIMEOUT",
+    "VERCEL_SANDBOX_SESSION_TTL",
 )
 
 

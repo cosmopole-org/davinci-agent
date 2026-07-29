@@ -11,6 +11,7 @@ from __future__ import annotations
 import importlib.util
 import io
 import json
+import re
 import sys
 import tarfile
 from pathlib import Path
@@ -381,6 +382,30 @@ def test_missing_token_is_reported_rather_than_calling_the_api():
         os.environ["VERCEL_TOKEN"] = "tok_test"
     assert out["ok"] is False and "VERCEL_TOKEN" in out["error"]
     assert fake.calls == []
+
+
+def test_deploy_bakes_every_token_spelling_the_tool_accepts():
+    """The tool accepts three names for the API token and the CI gate lets any
+    of them enable the deploy — so the bake list must carry all three, or an
+    operator who set one of the aliases deploys a creature that looks healthy
+    and refuses every call."""
+    sys.path.insert(0, str(_REPO / "scripts"))
+    import deploy_and_test  # noqa: PLC0415
+
+    for name in ("VERCEL_TOKEN", "VERCEL_API_TOKEN", "VERCEL_ACCESS_TOKEN"):
+        for key in ("VERCEL_TOKEN", "VERCEL_API_TOKEN", "VERCEL_ACCESS_TOKEN"):
+            os.environ.pop(key, None)
+        os.environ[name] = "tok_from_" + name
+        assert deploy_and_test.sandbox_bake_env().get(name) == "tok_from_" + name
+
+    # And every tuning knob tool.py reads is bakeable, so a setting an operator
+    # exports actually reaches the creature.
+    tool_src = (_REPO / "tools" / "vercel_sandbox" / "tool.py").read_text()
+    read_by_tool = set(re.findall(r'environ\.get\("(VERCEL_[A-Z_]+)"', tool_src))
+    read_by_tool |= set(re.findall(r'"(VERCEL_[A-Z_]+)"', tool_src)) & {
+        "VERCEL_TOKEN", "VERCEL_API_TOKEN", "VERCEL_ACCESS_TOKEN"}
+    assert read_by_tool <= set(deploy_and_test.SANDBOX_ENV_KEYS), (
+        f"not baked: {sorted(read_by_tool - set(deploy_and_test.SANDBOX_ENV_KEYS))}")
 
 
 def test_unknown_function_lists_the_supported_ones():

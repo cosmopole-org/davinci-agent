@@ -59,6 +59,47 @@ def test_no_key_yields_no_client_and_no_reasoner():
     assert reasoner_from_config({}) is None
 
 
+def test_per_agent_llm_override_from_backend_task_config():
+    """The exact ``config.llm`` block Nest attaches for a per-agent override.
+
+    The backend emits ``{provider, api_key, models: [<model>]}`` (single-element
+    ``models`` list from the admin's one "llm model" field). Davinci must select
+    that provider/model/key so the agent runs on the admin-chosen LLM instead of
+    the default env-var backbone.
+    """
+    cfg = {"llm": {"provider": "anthropic", "api_key": "sk-agent",
+                   "models": ["claude-opus-4-8"]}}
+    client = client_from_config(cfg)
+    assert client is not None
+    assert client.provider == "anthropic"
+    assert client.api_key == "sk-agent"
+    assert client.models == ["claude-opus-4-8"]
+
+
+def test_agent_override_wins_over_env_default(monkeypatch):
+    """When an agent carries an override, it beats the default env provider."""
+    monkeypatch.setenv("GEMINI_API_KEY", "env-gemini")
+    cfg = {"llm": {"provider": "openai", "api_key": "sk-agent",
+                   "models": ["gpt-4o"]}}
+    client = client_from_config(cfg)
+    assert client.provider == "openai"
+    assert client.api_key == "sk-agent"
+    assert client.models == ["gpt-4o"]
+
+
+def test_no_agent_override_falls_back_to_env_default(monkeypatch):
+    """With no override in the task config, davinci uses the env-var default."""
+    for var in ("GEMINI_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_API_KEY",
+                "GROK_API_KEY", "XAI_API_KEY", "AGENTROUTER_API_KEY",
+                "OPENROUTER_API_KEY"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "env-anthropic")
+    client = client_from_config({})
+    assert client is not None
+    assert client.provider == "anthropic"
+    assert client.api_key == "env-anthropic"
+
+
 def test_openrouter_selection_from_provider_name_and_model_config():
     cfg = {"llm_provider": "openrouter", "openrouter_api_key": "k",
            "openrouter_models": "anthropic/claude-sonnet-4.6"}
